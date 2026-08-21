@@ -9,6 +9,7 @@ pub mod backlight;
 pub mod buttons;
 pub mod display;
 pub mod leds;
+pub mod power;
 pub mod rtc;
 pub mod usb;
 

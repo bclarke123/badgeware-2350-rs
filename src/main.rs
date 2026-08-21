@@ -55,13 +55,25 @@ static FRAMEBUFFER: ConstStaticCell<[u8; FB_BYTES]> = ConstStaticCell::new([0; F
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
+    let mut p = embassy_rp::init(Default::default());
 
     // Latch board power before anything else: on battery, the badge browns out
     // if this pin is not asserted shortly after boot. It also powers the light
     // sensor, RTC, and Qwiic connector. Forget the pin so it stays high forever.
     let power_en = Output::new(p.PIN_41, Level::High);
     core::mem::forget(power_en);
+
+    // Stock-firmware sleep emulation: if the RESET button (readable on GPIO14
+    // after the reset it caused) is still held, ramp the rear LEDs and power
+    // off with any-front-button wake. Returns immediately on a normal boot.
+    bsp::power::sleep_if_reset_held(
+        p.PIN_14.reborrow(),
+        p.PIN_0.reborrow(),
+        p.PIN_1.reborrow(),
+        p.PIN_2.reborrow(),
+        p.PIN_3.reborrow(),
+    )
+    .await;
 
     // USB logging first so later init steps can report progress.
     let usb_driver = usb::Driver::new(p.USB, Irqs);

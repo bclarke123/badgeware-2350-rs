@@ -14,6 +14,7 @@ badge, currently shipping a Simon-style memory game on the five front buttons.
 | 4-zone rear LEDs | cue patterns (`src/bsp/leds.rs`) |
 | USB serial logging | `embassy-usb-logger` (`src/bsp/usb.rs`) |
 | PCF85063A RTC | high-score storage in its battery-backed RAM byte (`src/bsp/rtc.rs`) |
+| Sleep / power-off | hold RESET ~1.5 s → POWMAN off, any front button wakes (`src/bsp/power.rs`) |
 | WiFi/BT (RM2), battery gauge, PSRAM | not yet (see notes below) |
 
 ## Building & flashing (no debug probe needed)
