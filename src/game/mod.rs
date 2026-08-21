@@ -1,22 +1,27 @@
 //! Simon-style memory game built on the five front buttons.
 //!
 //! Watch the growing sequence flash on screen, then repeat it with the physical
-//! buttons. The on-screen pads mirror the button layout: A / B / C along the
-//! bottom edge (matching the buttons below the screen) and up / down on the
-//! right edge (matching the side buttons). Rear LEDs echo every step.
+//! buttons. The on-screen pads are positioned to line up with the physical
+//! controls (verified against a photo of the badge): A / B / C along the bottom
+//! edge directly above their buttons, UP and DN on the right edge beside the
+//! side buttons. Rear LEDs echo every step.
 //!
-//! Rendering is state-driven: the scene is redrawn and presented on every
-//! change rather than on a fixed tick — a memory game has no continuous motion,
-//! and this keeps the main loop trivially simple.
+//! All transitions are animated with cubic easing (see [`anim`]): pads pop in
+//! on the title screen, flashes inflate slightly, and the game-over screen
+//! slides in and counts the score up. Presents are vsync-locked (~60 Hz), so
+//! animation loops simply draw-present until their timeline finishes.
 
+mod anim;
+
+use embassy_futures::select::{select, Either};
 use embassy_rp::clocks::RoscRng;
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_time::{with_timeout, Duration, Ticker, Timer};
 use embedded_graphics::mono_font::ascii::{FONT_10X20, FONT_6X13};
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, RoundedRectangle};
-use embedded_graphics::text::Text;
+use embedded_graphics::text::{Alignment, Text};
 use heapless::Vec;
 
 use crate::bsp::buttons::{Button, ButtonEvent, EVENTS};
@@ -25,11 +30,16 @@ use crate::bsp::leds::{cue, LedCue};
 use crate::bsp::rtc::RtcRam;
 use crate::gfx::FrameBuffer;
 
+use anim::{ease_in_out_cubic, ease_out_cubic, lerp_color, scale_rect, Timeline};
+
 /// Longest sequence the game can hold; reaching it is a win by exhaustion.
 const MAX_SEQUENCE: usize = 64;
 
 /// How long the player has for each press before the round is failed.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Background color shared by every screen.
+const BACKGROUND: Rgb565 = Rgb565::new(2, 4, 4);
 
 /// The five playable pads, one per front button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,23 +65,26 @@ impl Pad {
         }
     }
 
-    /// Screen rectangle, mirroring the physical button positions.
+    /// Screen rectangle, aligned with the *physical* button positions as
+    /// measured from a photo of the badge: the A/B/C buttons sit left of
+    /// screen-center thirds, and the side DOWN button is well below the
+    /// screen's vertical middle.
     fn rect(self) -> Rectangle {
         match self {
-            Self::A => Rectangle::new(Point::new(10, 165), Size::new(90, 65)),
-            Self::B => Rectangle::new(Point::new(105, 165), Size::new(90, 65)),
-            Self::C => Rectangle::new(Point::new(200, 165), Size::new(90, 65)),
-            Self::Up => Rectangle::new(Point::new(245, 15), Size::new(65, 60)),
-            Self::Down => Rectangle::new(Point::new(245, 85), Size::new(65, 60)),
+            Self::A => Rectangle::new(Point::new(12, 172), Size::new(72, 62)),
+            Self::B => Rectangle::new(Point::new(92, 172), Size::new(72, 62)),
+            Self::C => Rectangle::new(Point::new(172, 172), Size::new(72, 62)),
+            Self::Up => Rectangle::new(Point::new(252, 30), Size::new(60, 52)),
+            Self::Down => Rectangle::new(Point::new(252, 146), Size::new(60, 52)),
         }
     }
 
     fn color(self) -> Rgb565 {
         match self {
-            Self::A => Rgb565::new(31, 12, 6),   // red
-            Self::B => Rgb565::new(31, 48, 0),   // amber
-            Self::C => Rgb565::new(6, 50, 10),   // green
-            Self::Up => Rgb565::new(4, 30, 31),  // blue
+            Self::A => Rgb565::new(31, 12, 6),    // red
+            Self::B => Rgb565::new(31, 48, 0),    // amber
+            Self::C => Rgb565::new(6, 50, 10),    // green
+            Self::Up => Rgb565::new(4, 30, 31),   // blue
             Self::Down => Rgb565::new(27, 8, 29), // magenta
         }
     }
@@ -91,13 +104,36 @@ impl Pad {
             Self::Down => "DN",
         }
     }
+
+    fn index(self) -> usize {
+        match self {
+            Self::A => 0,
+            Self::B => 1,
+            Self::C => 2,
+            Self::Up => 3,
+            Self::Down => 4,
+        }
+    }
 }
 
-/// Everything the scene renderer needs for one redraw.
-struct Scene<'a> {
-    lit: Option<Pad>,
+/// Per-pad visual state for one frame of animation.
+#[derive(Clone, Copy)]
+struct PadVis {
+    /// Size about the pad center: 0.0 collapsed, 1.0 resting, >1.0 inflated.
+    scale: f32,
+    /// 0.0 idle/dim through 1.0 fully lit (adds the white ring near 1.0).
+    glow: f32,
+}
+
+const PADS_IDLE: [PadVis; 5] = [PadVis { scale: 1.0, glow: 0.0 }; 5];
+
+/// Static text elements for one frame.
+struct Chrome<'a> {
     headline: &'a str,
+    /// Baseline y of the headline (animated on transitions).
+    headline_y: i32,
     subline: &'a str,
+    subline_color: Rgb565,
     score: usize,
     best: usize,
 }
@@ -117,19 +153,7 @@ pub async fn run(mut display: Display, mut frame: FrameBuffer, mut rtc: RtcRam) 
     loop {
         // ---- Attract screen ----
         cue(LedCue::Off);
-        draw_and_present(
-            &mut display,
-            &mut frame,
-            &Scene {
-                lit: None,
-                headline: "SIMON",
-                subline: "press A to start",
-                score: 0,
-                best,
-            },
-        )
-        .await;
-        wait_for_press(Button::A).await;
+        attract(&mut display, &mut frame, best).await;
 
         // ---- One game ----
         let mut sequence: Vec<u8, MAX_SEQUENCE> = Vec::new();
@@ -143,14 +167,12 @@ pub async fn run(mut display: Display, mut frame: FrameBuffer, mut rtc: RtcRam) 
 
             // Show phase: replay the sequence, speeding up as it grows.
             let on_ms = 500u64.saturating_sub(round as u64 * 20).max(160);
-            show_scene(&mut display, &mut frame, round - 1, best, None).await;
+            render_game(&mut display, &mut frame, round - 1, best, &PADS_IDLE).await;
             Timer::after_millis(600).await;
             for &step in &sequence {
                 let pad = PADS[step as usize];
                 cue(LedCue::Blink);
-                show_scene(&mut display, &mut frame, round - 1, best, Some(pad)).await;
-                Timer::after_millis(on_ms).await;
-                show_scene(&mut display, &mut frame, round - 1, best, None).await;
+                flash_pad(&mut display, &mut frame, round - 1, best, pad, on_ms).await;
                 Timer::after_millis(140).await;
             }
 
@@ -161,10 +183,8 @@ pub async fn run(mut display: Display, mut frame: FrameBuffer, mut rtc: RtcRam) 
                 let expected = PADS[step as usize];
                 match next_pad_press().await {
                     Some(pad) => {
-                        show_scene(&mut display, &mut frame, round - 1, best, Some(pad)).await;
                         cue(LedCue::Blink);
-                        Timer::after_millis(160).await;
-                        show_scene(&mut display, &mut frame, round - 1, best, None).await;
+                        flash_pad(&mut display, &mut frame, round - 1, best, pad, 160).await;
                         if pad != expected {
                             failed = true;
                             break;
@@ -194,59 +214,168 @@ pub async fn run(mut display: Display, mut frame: FrameBuffer, mut rtc: RtcRam) 
         }
         log::info!("game over, score {} best {}", score, best);
         cue(LedCue::Error);
-        draw_and_present(
-            &mut display,
-            &mut frame,
-            &Scene {
-                lit: None,
-                headline: "GAME OVER",
-                subline: "press A to retry",
-                score,
-                best,
-            },
-        )
-        .await;
-        Timer::after_millis(800).await;
-        drain_events();
-        wait_for_press(Button::A).await;
+        game_over(&mut display, &mut frame, score, best).await;
     }
 }
 
-/// Renders the in-game scene (score line plus pads, one optionally lit).
-async fn show_scene(
+/// Title screen: pads pop in staggered, headline slides down, then the prompt
+/// pulses until A is pressed.
+async fn attract(display: &mut Display, frame: &mut FrameBuffer, best: usize) {
+    const INTRO: Duration = Duration::from_millis(1100);
+    const TITLE_SLIDE: Duration = Duration::from_millis(450);
+    const POP_START: Duration = Duration::from_millis(350);
+    const POP_LEN: Duration = Duration::from_millis(300);
+    const POP_STAGGER: Duration = Duration::from_millis(90);
+
+    let intro = Timeline::new(INTRO);
+    while !intro.finished() {
+        let title_t = ease_out_cubic(intro.segment(Duration::from_millis(0), TITLE_SLIDE));
+        let mut vis = PADS_IDLE;
+        for (i, v) in vis.iter_mut().enumerate() {
+            let delay = POP_START + POP_STAGGER * i as u32;
+            v.scale = ease_out_cubic(intro.segment(delay, POP_LEN));
+        }
+        let chrome = Chrome {
+            headline: "SIMON",
+            headline_y: anim::lerp(-8.0, 34.0, title_t) as i32,
+            subline: "",
+            subline_color: BACKGROUND,
+            score: 0,
+            best,
+        };
+        draw_frame(display, frame, &chrome, &vis).await;
+    }
+
+    // Pulse the prompt until A starts a game.
+    const PULSE_PERIOD_MS: u64 = 1400;
+    let dim = Rgb565::new(8, 20, 12);
+    let bright = Rgb565::new(24, 58, 28);
+    let mut ticker = Ticker::every(Duration::from_millis(33));
+    let mut elapsed_ms: u64 = 0;
+    drain_events();
+    loop {
+        // Triangle wave over the period, smoothed by in-out cubic easing.
+        let phase = (elapsed_ms % PULSE_PERIOD_MS) as f32 / PULSE_PERIOD_MS as f32;
+        let tri = 1.0 - (2.0 * phase - 1.0).abs();
+        let chrome = Chrome {
+            headline: "SIMON",
+            headline_y: 34,
+            subline: "press A to start",
+            subline_color: lerp_color(dim, bright, ease_in_out_cubic(tri)),
+            score: 0,
+            best,
+        };
+        draw_frame(display, frame, &chrome, &PADS_IDLE).await;
+
+        match select(EVENTS.receive(), ticker.next()).await {
+            Either::First(ButtonEvent::Pressed(Button::A)) => return,
+            Either::First(_) => {}
+            Either::Second(()) => elapsed_ms += 33,
+        }
+    }
+}
+
+/// Game-over screen: headline slides in, the score counts up with easing, then
+/// waits for A.
+async fn game_over(display: &mut Display, frame: &mut FrameBuffer, score: usize, best: usize) {
+    const OUTRO: Duration = Duration::from_millis(1400);
+    const TITLE_SLIDE: Duration = Duration::from_millis(400);
+    const COUNT_DELAY: Duration = Duration::from_millis(300);
+    const COUNT_LEN: Duration = Duration::from_millis(900);
+
+    let outro = Timeline::new(OUTRO);
+    while !outro.finished() {
+        let title_t = ease_out_cubic(outro.segment(Duration::from_millis(0), TITLE_SLIDE));
+        let count_t = ease_out_cubic(outro.segment(COUNT_DELAY, COUNT_LEN));
+        let shown = (count_t * score as f32 + 0.5) as usize;
+        // Pads deflate slightly and dim during the outro.
+        let shrink = 1.0 - 0.12 * ease_in_out_cubic(outro.progress());
+        let vis = [PadVis { scale: shrink, glow: 0.0 }; 5];
+        let chrome = Chrome {
+            headline: "GAME OVER",
+            headline_y: anim::lerp(-8.0, 34.0, title_t) as i32,
+            subline: "",
+            subline_color: BACKGROUND,
+            score: shown,
+            best,
+        };
+        draw_frame(display, frame, &chrome, &vis).await;
+    }
+
+    drain_events();
+    let chrome = Chrome {
+        headline: "GAME OVER",
+        headline_y: 34,
+        subline: "press A to retry",
+        subline_color: Rgb565::new(20, 40, 20),
+        score,
+        best,
+    };
+    draw_frame(display, frame, &chrome, &PADS_IDLE).await;
+    wait_for_press(Button::A).await;
+}
+
+/// Lights one pad for `on_ms` with a quick eased inflate, then redraws idle.
+async fn flash_pad(
     display: &mut Display,
     frame: &mut FrameBuffer,
     score: usize,
     best: usize,
-    lit: Option<Pad>,
+    pad: Pad,
+    on_ms: u64,
 ) {
-    draw_and_present(
-        display,
-        frame,
-        &Scene {
-            lit,
-            headline: "WATCH & REPEAT",
-            subline: "",
-            score,
-            best,
-        },
-    )
-    .await;
+    const INFLATE: f32 = 0.09;
+    let flash = Timeline::new(Duration::from_millis(on_ms));
+    while !flash.finished() {
+        // Inflate over the first third of the flash, then hold.
+        let t = ease_out_cubic((flash.progress() * 3.0).min(1.0));
+        let mut vis = PADS_IDLE;
+        vis[pad.index()] = PadVis {
+            scale: 1.0 + INFLATE * t,
+            glow: 1.0,
+        };
+        render_game(display, frame, score, best, &vis).await;
+    }
+    render_game(display, frame, score, best, &PADS_IDLE).await;
 }
 
-/// Draws a full scene into the framebuffer and pushes it to the panel.
-async fn draw_and_present(display: &mut Display, frame: &mut FrameBuffer, scene: &Scene<'_>) {
+/// Renders the in-game scene with the given pad visuals.
+async fn render_game(
+    display: &mut Display,
+    frame: &mut FrameBuffer,
+    score: usize,
+    best: usize,
+    vis: &[PadVis; 5],
+) {
+    let chrome = Chrome {
+        headline: "WATCH & REPEAT",
+        headline_y: 34,
+        subline: "",
+        subline_color: BACKGROUND,
+        score,
+        best,
+    };
+    draw_frame(display, frame, &chrome, vis).await;
+}
+
+/// Draws one complete frame (chrome + pads) and presents it.
+async fn draw_frame(
+    display: &mut Display,
+    frame: &mut FrameBuffer,
+    chrome: &Chrome<'_>,
+    vis: &[PadVis; 5],
+) {
     // Infallible: FrameBuffer's error type is Infallible, so unwraps cannot fire.
-    let bg = Rgb565::new(2, 4, 4);
-    frame.clear(bg).unwrap();
+    frame.clear(BACKGROUND).unwrap();
 
     let title_style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
     let small_style = MonoTextStyle::new(&FONT_6X13, Rgb565::new(20, 40, 20));
-    Text::new(scene.headline, Point::new(12, 30), title_style)
+    Text::new(chrome.headline, Point::new(12, chrome.headline_y), title_style)
         .draw(frame)
         .unwrap();
-    if !scene.subline.is_empty() {
-        Text::new(scene.subline, Point::new(12, 55), small_style)
+    if !chrome.subline.is_empty() {
+        let subline_style = MonoTextStyle::new(&FONT_6X13, chrome.subline_color);
+        Text::new(chrome.subline, Point::new(12, chrome.headline_y + 25), subline_style)
             .draw(frame)
             .unwrap();
     }
@@ -254,35 +383,41 @@ async fn draw_and_present(display: &mut Display, frame: &mut FrameBuffer, scene:
     let mut score_buf = heapless::String::<32>::new();
     let _ = core::fmt::write(
         &mut score_buf,
-        format_args!("score {}   best {}", scene.score, scene.best),
+        format_args!("score {}   best {}", chrome.score, chrome.best),
     );
-    Text::new(&score_buf, Point::new(12, 80), small_style)
+    Text::new(&score_buf, Point::new(12, chrome.headline_y + 50), small_style)
         .draw(frame)
         .unwrap();
 
     for pad in PADS {
-        let lit = scene.lit == Some(pad);
-        let color = if lit { pad.color() } else { pad.dim_color() };
-        let rounded = RoundedRectangle::with_equal_corners(pad.rect(), Size::new(8, 8));
+        let v = vis[pad.index()];
+        if v.scale <= 0.05 {
+            continue;
+        }
+        let rect = scale_rect(pad.rect(), v.scale);
+        let color = lerp_color(pad.dim_color(), pad.color(), v.glow);
+        let rounded = RoundedRectangle::with_equal_corners(rect, Size::new(8, 8));
         rounded
             .into_styled(PrimitiveStyle::with_fill(color))
             .draw(frame)
             .unwrap();
-        if lit {
+        if v.glow > 0.7 {
             rounded
                 .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 3))
                 .draw(frame)
                 .unwrap();
         }
-        let center = pad.rect().center();
-        let label_style = MonoTextStyle::new(&FONT_6X13, Rgb565::WHITE);
-        Text::new(
-            pad.label(),
-            Point::new(center.x - 6, center.y + 4),
-            label_style,
-        )
-        .draw(frame)
-        .unwrap();
+        if v.scale > 0.5 {
+            let label_style = MonoTextStyle::new(&FONT_6X13, Rgb565::WHITE);
+            Text::with_alignment(
+                pad.label(),
+                rect.center() + Point::new(0, 4),
+                label_style,
+                Alignment::Center,
+            )
+            .draw(frame)
+            .unwrap();
+        }
     }
 
     display.present(frame.bytes()).await;
