@@ -1,0 +1,8 @@
+# Flash over USB with picotool (no debug probe required).
+# First flash: hold the BOOT button while plugging in USB, then `cargo run --release`.
+# After that, hold HOME for 2s to reboot back into BOOTSEL from running firmware.
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+runner = "picotool load -u -v -x -t elf"
+
+[build]
+target = "thumbv8m.main-none-eabihf"
