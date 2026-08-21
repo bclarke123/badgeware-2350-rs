@@ -8,7 +8,8 @@
 //!
 //! Controls:
 //! Left alone, the badge is a desk sculpture: every minute it plants a new
-//! seed and grows a fresh tree (manual input postpones the cycle).
+//! seed and grows a fresh tree (manual input postpones the cycle), while the
+//! sky drifts through a ten-minute day: dusk, sunset, starry night, dawn.
 //!
 //! * **A** — new random seed (saved to the RTC), regrow
 //! * **B** — replay growth of the current tree
@@ -27,9 +28,9 @@ use crate::bsp::display::{Display, WIDTH};
 use crate::bsp::leds::{cue, LedCue};
 use crate::bsp::rtc::RtcRam;
 use crate::gfx::FrameBuffer;
-use crate::render3d::math::{v3, Camera, Mat34, Vec3};
-use crate::render3d::{core1, ListBuilder, MeshTri, TriList};
-use anim::Timeline;
+use crate::render3d::math::{fast_sin, v3, Camera, Mat34, Vec3};
+use crate::render3d::{core1, tint, ListBuilder, MeshTri, TriList};
+use anim::{lerp_color, Timeline};
 use tree::Tree;
 
 /// Runs the plant sim forever; owns the display, framebuffer, RTC, and the
@@ -53,6 +54,21 @@ pub async fn run(
         dist: 3.2,
         target: v3(0.0, 0.1, 0.0),
     };
+    // Fixed starfield (screen-space positions + twinkle phases), deterministic.
+    let mut stars = [(0i32, 0i32, 0.0f32); STAR_COUNT];
+    {
+        let mut h: u32 = 0x1234_5677;
+        for star in &mut stars {
+            h ^= h << 13;
+            h ^= h >> 17;
+            h ^= h << 5;
+            let sx = (h % 320) as i32;
+            let sy = ((h >> 9) % 130) as i32;
+            let phase = ((h >> 17) % 256) as f32 / 40.0;
+            *star = (sx, sy, phase);
+        }
+    }
+
     let mut orbiting = true;
     let boot = Instant::now();
     let mut last_frame = Instant::now();
@@ -113,19 +129,24 @@ pub async fn run(
         }
         let time_s = boot.elapsed().as_micros() as f32 / 1_000_000.0;
 
+        // ---- Sky cycle ----
+        let phase = (time_s % DAY_CYCLE_S) / DAY_CYCLE_S;
+        let (sky_top, sky_bottom, night) = sky_for(phase);
+
         // ---- Geometry (core 0) ----
         let t0 = Instant::now();
         let view = camera.view();
         let mut builder = ListBuilder::new_view_space(tri_list);
-        push_ground(&view, &mut builder);
+        push_stars(&mut builder, &stars, night, time_s, sky_top);
+        push_ground(&view, &mut builder, tint(GROUND, 1.0 - 0.55 * night));
         the_tree.emit(&view, &growth, time_s, &mut builder);
         builder.finish();
         let t_geom = t0.elapsed().as_micros();
 
         // ---- Rasterize ----
         let t1 = Instant::now();
-        let top = RawU16::from(SKY_TOP).into_inner();
-        let bottom = RawU16::from(SKY_BOTTOM).into_inner();
+        let top = RawU16::from(sky_top).into_inner();
+        let bottom = RawU16::from(sky_bottom).into_inner();
         let (left, right) = frame.split_halves();
         core1::dispatch(core1::RasterJob {
             tris: core::ptr::from_ref(tri_list),
@@ -156,13 +177,76 @@ pub async fn run(
     }
 }
 
-/// Dusk sky gradient: lighter overhead, deepening toward the horizon.
-const SKY_TOP: Rgb565 = Rgb565::new(3, 10, 14);
-const SKY_BOTTOM: Rgb565 = Rgb565::new(1, 5, 9);
+/// One full sky day, in seconds (10 minutes).
+const DAY_CYCLE_S: f32 = 600.0;
+
+/// Number of stars in the night sky.
+const STAR_COUNT: usize = 40;
+
+/// Sky keyframes around the day cycle: (top, bottom) at phases 0, .25, .5, .75.
+/// Dusk blue, sunset orange glow, deep night purple, pink dawn.
+const SKY_KEYS: [(Rgb565, Rgb565); 4] = [
+    (Rgb565::new(3, 10, 14), Rgb565::new(1, 5, 9)),   // dusk (the original)
+    (Rgb565::new(5, 9, 15), Rgb565::new(22, 26, 3)),  // sunset: orange horizon
+    (Rgb565::new(2, 2, 7), Rgb565::new(4, 3, 10)),    // night: dark purple
+    (Rgb565::new(7, 11, 17), Rgb565::new(24, 22, 18)), // dawn: pink horizon
+];
+
+/// Sky gradient and star visibility (0..=1) for a cycle phase in 0..1.
+fn sky_for(phase: f32) -> (Rgb565, Rgb565, f32) {
+    let scaled = phase * 4.0;
+    let idx = (scaled as usize) % 4;
+    let next = (idx + 1) % 4;
+    // Smoothstep the blend so the sky lingers on each mood.
+    let f = scaled - scaled as i32 as f32;
+    let f = f * f * (3.0 - 2.0 * f);
+    let top = lerp_color(SKY_KEYS[idx].0, SKY_KEYS[next].0, f);
+    let bottom = lerp_color(SKY_KEYS[idx].1, SKY_KEYS[next].1, f);
+    // Stars ramp in around the night keyframe (phase 0.5).
+    let d = (phase - 0.5).abs();
+    let night = ((0.16 - d) / 0.06).clamp(0.0, 1.0);
+    (top, bottom, night)
+}
+
+/// Emits the starfield as tiny far-plane triangles (fixed on screen, like a
+/// skybox; drawn first by the painter's sort so the tree occludes them).
+fn push_stars(
+    out: &mut ListBuilder<'_>,
+    stars: &[(i32, i32, f32); STAR_COUNT],
+    night: f32,
+    time_s: f32,
+    sky_top: Rgb565,
+) {
+    if night <= 0.01 {
+        return;
+    }
+    // Far plane: depth key 30 * 2048 stays inside u16 and behind everything.
+    const Z: f32 = 30.0;
+    const FOCAL: f32 = 228.0;
+    let size = 1.6 * Z / FOCAL; // ~1.6 px on screen
+    let white = Rgb565::new(26, 56, 31);
+    for &(sx, sy, twinkle_phase) in stars {
+        let twinkle = 0.55 + 0.45 * fast_sin(time_s * 1.9 + twinkle_phase);
+        let color = lerp_color(sky_top, white, night * twinkle);
+        let x = (sx as f32 - 160.0) * Z / FOCAL;
+        let y = (120.0 - sy as f32) * Z / FOCAL;
+        let p = v3(x, y, Z);
+        out.push(MeshTri {
+            v: [
+                p.add(v3(0.0, size, 0.0)),
+                p.add(v3(size, -size, 0.0)),
+                p.add(v3(-size, -size, 0.0)),
+            ],
+            color,
+        });
+    }
+}
+
+/// Ground base color; night dimming is applied by the caller per frame.
+const GROUND: Rgb565 = Rgb565::new(4, 13, 4); // pre-baked ~0.55 sun intensity
 
 /// A simple ground plane under the tree (world space, wound +y outward).
-fn push_ground(view: &Mat34, out: &mut ListBuilder<'_>) {
-    const GROUND: Rgb565 = Rgb565::new(4, 13, 4); // pre-baked: old sun lighting lit up-facing ground at ~0.55
+fn push_ground(view: &Mat34, out: &mut ListBuilder<'_>, color: Rgb565) {
     let y = -0.95;
     let e = 2.2;
     let corners = [
@@ -172,8 +256,8 @@ fn push_ground(view: &Mat34, out: &mut ListBuilder<'_>) {
         v3(e, y, -e),
     ];
     let p: [Vec3; 4] = corners.map(|c| view.transform_point(c));
-    out.push(MeshTri { v: [p[0], p[1], p[2]], color: GROUND });
-    out.push(MeshTri { v: [p[0], p[2], p[3]], color: GROUND });
+    out.push(MeshTri { v: [p[0], p[1], p[2]], color });
+    out.push(MeshTri { v: [p[0], p[2], p[3]], color });
 }
 
 // Rust guideline compliant 2026-08-21
