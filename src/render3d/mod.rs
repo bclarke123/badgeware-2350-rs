@@ -1,8 +1,8 @@
 //! Software 3D pipeline: dual-core tiled flat-shaded triangle rendering.
 //!
 //! Frame flow (strict fork-join, decided in planning):
-//! 1. Core 0 transforms model triangles to view space, near-clips, projects,
-//!    lights, and painter-sorts them into one shared [`TriList`].
+//! 1. Core 0 assembles view-space triangles (emitters bake their own colors),
+//!    near-clips, projects, and painter-sorts into one shared [`TriList`].
 //! 2. Core 0 hands core 1 the RIGHT half of the framebuffer via [`core1`]'s
 //!    signal handshake, rasterizes the LEFT half itself, then joins.
 //! 3. Core 0 presents. The column-major framebuffer makes the two halves
@@ -20,13 +20,13 @@ use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 
 use crate::bsp::display::{HEIGHT, WIDTH};
-use math::{Mat34, Vec3};
+use math::Vec3;
 
-/// Maximum triangles per frame. 1024 x 16 bytes = 16 KiB; more than can be
-/// usefully distinguished on a 320x240 panel.
-pub const MAX_TRIS: usize = 1024;
+/// Maximum triangles per frame. 2048 x 16 bytes = 32 KiB; sized for a dense
+/// blossom tree (4 triangles per flower, up to 384 leaves) with headroom.
+pub const MAX_TRIS: usize = 2048;
 
-/// A model-space input triangle (counter-clockwise winding faces the camera).
+/// A view-space input triangle with its final (pre-lit) color.
 #[derive(Debug, Clone, Copy)]
 pub struct MeshTri {
     pub v: [Vec3; 3],
@@ -64,48 +64,34 @@ const NEAR: f32 = 0.1;
 /// Focal length in pixels for a ~70 degree horizontal field of view.
 const FOCAL: f32 = 228.0;
 
-/// Directional light (view-space-ish, normalized in `build_list`).
-const SUN: Vec3 = math::v3(0.45, -0.8, -0.4);
-
-/// Push-based frame assembler: transforms, clips, lights, projects each
-/// pushed triangle, then depth-sorts on [`ListBuilder::finish`].
+/// Push-based frame assembler: clips, projects, and depth-keys each pushed
+/// view-space triangle, then depth-sorts on [`ListBuilder::finish`].
 ///
 /// Push-based (rather than slice-based) so procedural emitters like the tree
-/// stream triangles without materializing a mesh buffer. Triangles beyond
-/// [`MAX_TRIS`] are dropped silently (the cap is far above any real scene);
-/// back-facing (clockwise on screen) triangles are culled.
+/// stream triangles without materializing a mesh buffer. Triangles arrive
+/// already in view space with final colors — emitters bake their lighting
+/// (billboard/ribbon normals are near-constant, so per-triangle sun shading
+/// was pure per-frame waste; measured as a large share of geometry time).
+/// Triangles beyond [`MAX_TRIS`] are dropped silently; back-facing (clockwise
+/// on screen) triangles are culled.
 pub struct ListBuilder<'a> {
     out: &'a mut TriList,
-    mv: Mat34,
-    sun: Vec3,
 }
 
 impl<'a> ListBuilder<'a> {
-    /// Starts a new frame. Pass identity matrices to push view-space
-    /// triangles directly (the camera-facing tree ribbons do this).
-    pub fn new(model: &Mat34, view: &Mat34, out: &'a mut TriList) -> Self {
+    /// Starts a new frame of view-space triangles.
+    pub fn new_view_space(out: &'a mut TriList) -> Self {
         out.len = 0;
-        Self {
-            out,
-            mv: view.mul(model),
-            sun: SUN.normalize(),
-        }
+        Self { out }
     }
 
-    /// Adds one triangle to the frame.
+    /// Adds one view-space triangle to the frame.
     pub fn push(&mut self, tri: MeshTri) {
-        let a = self.mv.transform_point(tri.v[0]);
-        let b = self.mv.transform_point(tri.v[1]);
-        let c = self.mv.transform_point(tri.v[2]);
-
-        // Lighting from the view-space face normal, computed before clipping.
-        let normal = b.sub(a).cross(c.sub(a)).normalize();
-        let intensity = 0.55 + 0.45 * normal.dot(self.sun).max(0.0);
-        let color = shade(tri.color, intensity);
+        let color = embedded_graphics::pixelcolor::raw::RawU16::from(tri.color).into_inner();
 
         // Near-plane clip: emit the surviving polygon (0, 3, or 4 vertices).
         let mut poly = [Vec3::default(); 4];
-        let n = clip_near(&[a, b, c], &mut poly);
+        let n = clip_near(&tri.v, &mut poly);
         if n < 3 {
             return;
         }
@@ -120,6 +106,13 @@ impl<'a> ListBuilder<'a> {
     pub fn finish(self) {
         self.out.tris[..self.out.len].sort_unstable_by_key(|t| core::cmp::Reverse(t.depth));
     }
+}
+
+/// Scales an RGB565 color by `f`, clamping each channel (used by emitters to
+/// bake lighting and tone variants at generation time).
+pub fn tint(color: Rgb565, f: f32) -> Rgb565 {
+    let ch = |v: u8, max: u8| ((f32::from(v)) * f).min(f32::from(max)) as u8;
+    Rgb565::new(ch(color.r(), 31), ch(color.g(), 63), ch(color.b(), 31))
 }
 
 /// Projects one clipped view-space triangle and appends it if front-facing.
@@ -175,14 +168,6 @@ fn clip_near(tri: &[Vec3; 3], out: &mut [Vec3; 4]) -> usize {
         }
     }
     n
-}
-
-/// Scales an RGB565 color by a 0..=1 intensity, per channel.
-fn shade(color: Rgb565, intensity: f32) -> u16 {
-    let scale = |v: u8| (f32::from(v) * intensity) as u8;
-    let shaded = Rgb565::new(scale(color.r()), scale(color.g()), scale(color.b()));
-    use embedded_graphics::pixelcolor::raw::RawU16;
-    RawU16::from(shaded).into_inner()
 }
 
 // Rust guideline compliant 2026-08-21

@@ -41,8 +41,9 @@ pub struct RasterJob {
     /// Start of the right framebuffer half, [`HALF_BYTES`] long, exclusively
     /// core 1's between `JOB` and `DONE`.
     pub fb_half: *mut u8,
-    /// Background color for the clear pass.
-    pub clear: u16,
+    /// Sky gradient for the clear pass (top and bottom RGB565).
+    pub clear_top: u16,
+    pub clear_bottom: u16,
 }
 
 // SAFETY: the raw pointers refer to 'static allocations whose exclusive use
@@ -98,7 +99,14 @@ fn worker() -> ! {
         // exactly HALF_BYTES bytes, untouched by core 0 until DONE.
         let half = unsafe { core::slice::from_raw_parts_mut(job.fb_half, HALF_BYTES) };
 
-        raster::draw_list(tris, half, (WIDTH / 2) as i32, WIDTH as i32, job.clear);
+        raster::draw_list(
+            tris,
+            half,
+            (WIDTH / 2) as i32,
+            WIDTH as i32,
+            job.clear_top,
+            job.clear_bottom,
+        );
 
         DONE.signal(());
         // Wake core 0's executor promptly (its thread-mode pender WFEs too).

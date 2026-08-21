@@ -8,9 +8,12 @@ branches, billboard leaves (blossoms on some seeds), wind sway, and staggered
 cubic-eased growth from bare trunk to full bloom. A Simon-style memory game
 lived here previously — see git history.
 
-**Controls**: A = new seed (saved), B = replay growth, UP/DOWN = zoom,
-C = dual/single-core raster toggle (timings on USB serial), HOME-hold =
-BOOTSEL, RESET-hold = sleep.
+Left alone it is a desk sculpture: every minute it plants a new seed and grows
+a fresh tree.
+
+**Controls**: A = new seed (saved), B = replay growth, C = pause/resume orbit,
+UP/DOWN = zoom, HOME-hold = BOOTSEL, RESET-hold = sleep. Frame timings and
+seeds are logged over USB serial.
 
 ## 3D renderer (`src/render3d`)
 

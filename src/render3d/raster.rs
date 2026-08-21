@@ -20,21 +20,61 @@ use crate::bsp::display::HEIGHT;
 /// Rounding bias: half a pixel in 16.16 fixed point.
 const HALF_PX: i32 = 0x8000;
 
-/// Clears a framebuffer half to `clear` and draws `list` back-to-front.
+/// Clears a framebuffer half to a vertical gradient (`clear_top` at y=0 to
+/// `clear_bottom` at the bottom) and draws `list` back-to-front.
+///
+/// The gradient costs almost nothing in column-major storage: every column is
+/// identical, so one 240-pixel column is computed and block-copied per column.
 ///
 /// `x0..x1` is the half's absolute column range; `half` must be exactly
 /// `(x1 - x0) * HEIGHT * 2` bytes.
-pub fn draw_list(list: &TriList, half: &mut [u8], x0: i32, x1: i32, clear: u16) {
+pub fn draw_list(list: &TriList, half: &mut [u8], x0: i32, x1: i32, clear_top: u16, clear_bottom: u16) {
     debug_assert_eq!(half.len(), ((x1 - x0) as usize) * HEIGHT * 2);
-    let hi = (clear >> 8) as u8;
-    let lo = clear as u8;
-    for px in half.chunks_exact_mut(2) {
-        px[0] = hi;
-        px[1] = lo;
+
+    // Ordered (Bayer 4x4) dithering hides the banding a 5/6-bit gradient
+    // would otherwise show over 240 rows. All columns share the gradient but
+    // dithering must vary with x, so four column variants are built (one per
+    // Bayer x-phase) and cycled by *absolute* column so the pattern is
+    // seamless across the two cores' halves.
+    const BAYER: [[u8; 4]; 4] = [
+        [0, 128, 32, 160],
+        [192, 64, 224, 96],
+        [48, 176, 16, 144],
+        [240, 112, 208, 80],
+    ];
+    let (tr, tg, tb) = unpack565(clear_top);
+    let (br, bg, bb) = unpack565(clear_bottom);
+    let mut columns = [[0u8; HEIGHT * 2]; 4];
+    for (phase, column) in columns.iter_mut().enumerate() {
+        for (y, px) in column.chunks_exact_mut(2).enumerate() {
+            // 8.8 fixed-point lerp per channel; the fractional part decides,
+            // against the Bayer threshold, whether to round this pixel up.
+            let t = (y * 256 / (HEIGHT - 1)) as i32;
+            let threshold = i32::from(BAYER[y & 3][phase]);
+            let mix = |top: i32, bottom: i32, max: i32| {
+                let fp = (top << 8) + (bottom - top) * t;
+                ((fp >> 8) + i32::from(fp & 0xff > threshold)).clamp(0, max)
+            };
+            let r = mix(tr, br, 31);
+            let g = mix(tg, bg, 63);
+            let b = mix(tb, bb, 31);
+            let c = ((r as u16) << 11) | ((g as u16) << 5) | b as u16;
+            px[0] = (c >> 8) as u8;
+            px[1] = c as u8;
+        }
     }
+    for (i, col) in half.chunks_exact_mut(HEIGHT * 2).enumerate() {
+        let x = x0 as usize + i;
+        col.copy_from_slice(&columns[x & 3]);
+    }
+
     for tri in &list.tris[..list.len] {
         draw_tri(tri, half, x0, x1);
     }
+}
+
+fn unpack565(c: u16) -> (i32, i32, i32) {
+    (i32::from(c >> 11) & 31, i32::from(c >> 5) & 63, i32::from(c) & 31)
 }
 
 /// Rasterizes one screen-space triangle into a framebuffer half.

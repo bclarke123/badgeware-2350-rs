@@ -6,7 +6,7 @@
 //! a camera-facing tapered ribbon (2 triangles), each leaf a screen-aligned
 //! billboard quad. Camera-facing emission happens in view space, which is why
 //! [`Tree::emit`] takes the view matrix and pushes into a [`ListBuilder`]
-//! constructed with identity transforms.
+//! constructed with [`ListBuilder::new_view_space`].
 //!
 //! Growth is time-based: depth `d` branches grow during their own window of
 //! the shared [`Timeline`] (via `Timeline::segment`), so the trunk finishes
@@ -22,7 +22,7 @@ use crate::render3d::math::{fast_cos, fast_sin};
 
 use super::anim::{ease_out_cubic, Timeline};
 use crate::render3d::math::{v3, Mat34, Vec3};
-use crate::render3d::{ListBuilder, MeshTri};
+use crate::render3d::{tint, ListBuilder, MeshTri};
 
 /// Deepest branch generation (trunk is depth 0; leaves attach at this depth).
 const MAX_DEPTH: u8 = 5;
@@ -31,7 +31,7 @@ const MAX_DEPTH: u8 = 5;
 /// gets a slightly thinner tree).
 pub const MAX_BRANCHES: usize = 192;
 /// Leaf capacity, pruned the same way.
-pub const MAX_LEAVES: usize = 288;
+pub const MAX_LEAVES: usize = 384;
 
 /// Per-depth growth stagger and per-branch growth duration.
 const GROW_STAGGER_MS: u64 = 850;
@@ -42,6 +42,13 @@ const LEAF_LEN_MS: u64 = 700;
 /// Total time from seed to full bloom (for callers pacing a replay).
 pub const TOTAL_GROW_MS: u64 =
     (MAX_DEPTH as u64 + 1) * GROW_STAGGER_MS + GROW_LEN_MS + LEAF_LEN_MS;
+
+/// Per-seed shape parameters rolled once in [`Tree::generate`].
+struct Species {
+    blossoms: bool,
+    /// Branch-pitch multiplier: <1.0 tall and narrow, >1.0 wide and squat.
+    spread: f32,
+}
 
 #[derive(Clone, Copy)]
 struct Branch {
@@ -59,6 +66,10 @@ struct Leaf {
     color: Rgb565,
     /// 0..1 jitter spreading the leaf pop-in inside its window.
     phase: f32,
+    /// Base orientation of the billboard shape (radians).
+    angle: f32,
+    /// Blossom flower (two layered diamonds) vs foliage leaf (two-tone kite).
+    blossom: bool,
 }
 
 /// A generated tree, ready to emit each frame. Lives in a static (it is a few
@@ -81,15 +92,22 @@ impl Tree {
         // Knuth multiplicative hash spreads consecutive seed bytes into very
         // different trees; |1 keeps xorshift out of its zero fixed point.
         let mut rng = XorShift(seed.wrapping_mul(2654435761).wrapping_add(0x9e37_79b9) | 1);
-        // Sakura-ish seeds carry blossoms; the rest stay leafy green.
-        let blossoms = rng.unit() < 0.4;
+        // Per-seed species character: sakura-ish seeds carry blossoms, and
+        // silhouettes range from tall-and-narrow to wide-and-squat.
+        let species = Species {
+            blossoms: rng.unit() < 0.4,
+            // <1.0 = upright poplar-ish, >1.0 = spreading oak-ish.
+            spread: rng.range(0.75, 1.4),
+        };
+        let trunk_len = rng.range(0.55, 0.85);
+        let trunk_radius = 0.075 * rng.range(0.9, 1.15);
         self.grow(
             v3(0.0, -0.95, 0.0),
             v3(0.0, 1.0, 0.0),
-            0.75,
-            0.075,
+            trunk_len,
+            trunk_radius,
             0,
-            blossoms,
+            &species,
             &mut rng,
         );
     }
@@ -102,7 +120,7 @@ impl Tree {
         length: f32,
         radius: f32,
         depth: u8,
-        blossoms: bool,
+        species: &Species,
         rng: &mut XorShift,
     ) {
         let end = start.add(dir.scale(length));
@@ -118,25 +136,29 @@ impl Tree {
         }
 
         if depth == MAX_DEPTH {
-            let leaves = 2 + (rng.next() % 2) as usize;
+            let leaves = 3 + (rng.next() % 2) as usize;
             for _ in 0..leaves {
                 let jitter = v3(
                     rng.range(-0.08, 0.08),
                     rng.range(-0.03, 0.10),
                     rng.range(-0.08, 0.08),
                 );
-                let color = if blossoms && rng.unit() < 0.65 {
+                let blossom = species.blossoms && rng.unit() < 0.65;
+                // The 0.75 tint bakes the retired per-triangle sun lighting.
+                let color = if blossom {
                     // Blossom pinks.
-                    Rgb565::new(29, 34 + (rng.next() % 14) as u8, 24)
+                    tint(Rgb565::new(28, 30 + (rng.next() % 12) as u8, 22), 0.75)
                 } else {
                     // Leaf greens.
-                    Rgb565::new(4 + (rng.next() % 6) as u8, 34 + (rng.next() % 20) as u8, 6)
+                    tint(Rgb565::new(4 + (rng.next() % 6) as u8, 34 + (rng.next() % 20) as u8, 6), 0.75)
                 };
                 let leaf = Leaf {
                     pos: end.add(jitter),
-                    size: rng.range(0.045, 0.085),
+                    size: rng.range(0.055, 0.10),
                     color,
                     phase: rng.unit(),
+                    angle: rng.range(0.0, core::f32::consts::TAU),
+                    blossom,
                 };
                 if self.leaves.push(leaf).is_err() {
                     return;
@@ -152,13 +174,15 @@ impl Tree {
         for k in 0..children {
             let azimuth = azimuth0 + k as f32 * core::f32::consts::TAU / children as f32
                 + rng.range(-0.3, 0.3);
-            let pitch = rng.range(0.35, 0.65);
+            // Spread widens (or steepens) the whole silhouette; the upward
+            // bias shrinks as spread grows so squat trees actually stay squat.
+            let pitch = (rng.range(0.35, 0.65) * species.spread).min(1.15);
             let lateral = u.scale(fast_cos(azimuth)).add(v.scale(fast_sin(azimuth)));
             // Slight upward bias keeps the crown from drooping.
             let child_dir = dir
                 .scale(fast_cos(pitch))
                 .add(lateral.scale(fast_sin(pitch)))
-                .add(v3(0.0, 0.12, 0.0))
+                .add(v3(0.0, 0.12 / species.spread, 0.0))
                 .normalize();
             self.grow(
                 end,
@@ -166,7 +190,7 @@ impl Tree {
                 length * rng.range(0.62, 0.78),
                 radius * 0.62,
                 depth + 1,
-                blossoms,
+                species,
                 rng,
             );
         }
@@ -174,9 +198,9 @@ impl Tree {
 
     /// Emits the tree at the current growth instant into `out`.
     ///
-    /// `out` must have been built with identity model/view matrices: ribbons
-    /// and leaf billboards are camera-facing, so this function does the view
-    /// transform itself and pushes view-space triangles.
+    /// `out` must be a view-space builder: ribbons and leaf billboards are
+    /// camera-facing, so this function does the view transform itself and
+    /// pushes view-space triangles with pre-baked colors.
     pub fn emit(&self, view: &Mat34, growth: &Timeline, time_s: f32, out: &mut ListBuilder<'_>) {
         for b in &self.branches {
             let t = ease_out_cubic(growth.segment(
@@ -224,18 +248,62 @@ impl Tree {
             }
             let p = view.transform_point(sway(leaf.pos, time_s));
             let s = leaf.size * t;
-            // Screen-aligned billboard, wound toward the camera (-z normal).
-            push_quad(
-                out,
-                p.add(v3(-s, -s, 0.0)),
-                p.add(v3(-s, s, 0.0)),
-                p.add(v3(s, s, 0.0)),
-                p.add(v3(s, -s, 0.0)),
-                leaf.color,
-            );
+            // Gentle flutter on top of the leaf's fixed orientation.
+            let angle = leaf.angle + 0.18 * fast_sin(time_s * 2.1 + leaf.phase * 6.3);
+            if leaf.blossom {
+                emit_blossom(out, p, s * 0.85, angle, leaf.color);
+            } else {
+                emit_leaf(out, p, s, angle, leaf.color);
+            }
         }
     }
 }
+
+/// A foliage leaf: a rotated kite with a dark and a light half, reading as a
+/// curved leaf with a center vein catching the light. 2 triangles.
+fn emit_leaf(out: &mut ListBuilder<'_>, p: Vec3, s: f32, angle: f32, color: Rgb565) {
+    let rot = rotator(p, angle);
+    let tip = rot(0.0, 1.05 * s, 0.0);
+    let right = rot(0.55 * s, 0.25 * s, 0.0);
+    let base = rot(0.0, -0.4 * s, 0.0);
+    let left = rot(-0.55 * s, 0.25 * s, 0.0);
+    // Winding chosen camera-facing (see the cube-face convention in flora).
+    out.push(MeshTri { v: [tip, base, left], color: tint(color, 0.72) });
+    out.push(MeshTri { v: [tip, right, base], color: tint(color, 1.12) });
+}
+
+/// A blossom: an outer pink diamond with a smaller, brighter diamond rotated
+/// 45 degrees layered just in front — a five-minute flower. 4 triangles.
+fn emit_blossom(out: &mut ListBuilder<'_>, p: Vec3, s: f32, angle: f32, color: Rgb565) {
+    let outer = rotator(p, angle);
+    let n = outer(0.0, s, 0.0);
+    let e = outer(s, 0.0, 0.0);
+    let s2 = outer(0.0, -s, 0.0);
+    let w = outer(-s, 0.0, 0.0);
+    out.push(MeshTri { v: [n, s2, w], color });
+    out.push(MeshTri { v: [n, e, s2], color });
+
+    // Inner layer: nudged toward the camera so the painter's sort keeps it on
+    // top of its own outer petals.
+    let inner = rotator(p, angle + core::f32::consts::FRAC_PI_4);
+    let i = 0.55 * s;
+    let z = -0.02;
+    let n = inner(0.0, i, z);
+    let e = inner(i, 0.0, z);
+    let s2 = inner(0.0, -i, z);
+    let w = inner(-i, 0.0, z);
+    let bright = tint(color, 1.25);
+    out.push(MeshTri { v: [n, s2, w], color: bright });
+    out.push(MeshTri { v: [n, e, s2], color: bright });
+}
+
+/// Billboard-space point placement: rotates local (x, y) by `angle` about the
+/// view-space center `p`, with an optional depth nudge.
+fn rotator(p: Vec3, angle: f32) -> impl Fn(f32, f32, f32) -> Vec3 {
+    let (c, s) = (fast_cos(angle), fast_sin(angle));
+    move |x: f32, y: f32, z: f32| p.add(v3(x * c - y * s, x * s + y * c, z))
+}
+
 
 /// Wind: a smooth displacement field over height and time. Being a pure
 /// function of position, parent tips and child bases displace identically —
@@ -252,9 +320,11 @@ fn sway(p: Vec3, time_s: f32) -> Vec3 {
 }
 
 fn bark_color(depth: u8) -> Rgb565 {
-    // Trunk dark brown, lightening toward the twigs.
+    // Trunk dark brown, lightening toward the twigs. The 0.75 factor bakes
+    // the sun intensity the old per-triangle lighting produced for
+    // camera-facing surfaces, keeping the established look.
     let d = u8::min(depth, 5);
-    Rgb565::new(10 + d * 2, 16 + d * 4, 5 + d)
+    tint(Rgb565::new(10 + d * 2, 16 + d * 4, 5 + d), 0.75)
 }
 
 /// Pushes a quad as two triangles (a,b,c) + (a,c,d).
