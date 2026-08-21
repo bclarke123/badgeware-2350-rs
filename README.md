@@ -1,7 +1,27 @@
 # tufty-2350
 
 Rust/[Embassy](https://embassy.dev) firmware for the [Pimoroni Tufty 2350](https://github.com/pimoroni/tufty2350)
-badge, currently shipping a Simon-style memory game on the five front buttons.
+badge: a procedurally grown 3D tree on a dual-core software renderer and a
+custom PIO+DMA display driver. Each seed byte (persisted in the RTC's
+battery-backed RAM) grows a different deterministic tree — recursive ribbon
+branches, billboard leaves (blossoms on some seeds), wind sway, and staggered
+cubic-eased growth from bare trunk to full bloom. A Simon-style memory game
+lived here previously — see git history.
+
+**Controls**: A = new seed (saved), B = replay growth, UP/DOWN = zoom,
+C = dual/single-core raster toggle (timings on USB serial), HOME-hold =
+BOOTSEL, RESET-hold = sleep.
+
+## 3D renderer (`src/render3d`)
+
+Flat-shaded triangles, painter's algorithm, per-triangle directional lighting,
+near-plane clipping. Both cores rasterize ("tiled" split): core 0 builds,
+lights, and depth-sorts the frame's triangle list, hands core 1 the right half
+of the framebuffer via an `embassy-sync` Signal handshake (bare loop on core 1,
+no executor), rasterizes the left half itself, joins, and presents. The
+column-major framebuffer makes the two halves contiguous disjoint slices. The
+rasterizer walks triangles column-by-column (f32 setup, 16.16 fixed per-column
+increments) so the hot loop is a sequential byte fill.
 
 ## Hardware covered
 
@@ -13,7 +33,8 @@ badge, currently shipping a Simon-style memory game on the five front buttons.
 | Backlight (PWM) + phototransistor | auto-brightness (`src/bsp/backlight.rs`) |
 | 4-zone rear LEDs | cue patterns (`src/bsp/leds.rs`) |
 | USB serial logging | `embassy-usb-logger` (`src/bsp/usb.rs`) |
-| PCF85063A RTC | high-score storage in its battery-backed RAM byte (`src/bsp/rtc.rs`) |
+| PCF85063A RTC | battery-backed RAM byte for persistence (`src/bsp/rtc.rs`) |
+| Dual-core rendering | core 1 rasterization coprocessor (`src/render3d/core1.rs`) |
 | Sleep / power-off | hold RESET ~1.5 s → POWMAN off, any front button wakes (`src/bsp/power.rs`) |
 | WiFi/BT (RM2), battery gauge, PSRAM | not yet (see notes below) |
 

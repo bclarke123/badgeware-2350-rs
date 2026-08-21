@@ -5,6 +5,8 @@
 //! can stretch if a frame waits on vblank). The RP2350's Cortex-M33 has a
 //! single-precision FPU, so `f32` math here is cheap.
 
+#![allow(dead_code, reason = "animation toolkit; remaining consumers arrive with the growth sim")]
+
 use embassy_time::{Duration, Instant};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;

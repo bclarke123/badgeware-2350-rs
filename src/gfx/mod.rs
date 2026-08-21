@@ -34,6 +34,14 @@ impl FrameBuffer {
         self.buf
     }
 
+    /// Splits the frame into its left and right screen halves.
+    ///
+    /// Column-major storage makes each half one contiguous slice, which is
+    /// what lets the two cores rasterize disjoint halves with no aliasing.
+    pub fn split_halves(&mut self) -> (&mut [u8], &mut [u8]) {
+        self.buf.split_at_mut(WIDTH / 2 * HEIGHT * 2)
+    }
+
     #[inline]
     fn set_pixel(&mut self, x: usize, y: usize, color: Rgb565) {
         let raw = RawU16::from(color).into_inner();

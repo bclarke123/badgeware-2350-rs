@@ -11,8 +11,9 @@
 #![no_main]
 
 mod bsp;
-mod game;
+mod flora;
 mod gfx;
+mod render3d;
 
 use embassy_executor::Spawner;
 use embassy_rp::block::ImageDef;
@@ -53,6 +54,13 @@ bind_interrupts!(struct Irqs {
 /// never on the stack).
 static FRAMEBUFFER: ConstStaticCell<[u8; FB_BYTES]> = ConstStaticCell::new([0; FB_BYTES]);
 
+/// The shared 3D triangle list (16 KiB), also `.bss`, shared with core 1.
+static TRI_LIST: ConstStaticCell<render3d::TriList> =
+    ConstStaticCell::new(render3d::TriList::EMPTY);
+
+/// The generated tree (a few KiB — too large to live inside a task future).
+static TREE: ConstStaticCell<flora::tree::Tree> = ConstStaticCell::new(flora::tree::Tree::EMPTY);
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let mut p = embassy_rp::init(Default::default());
@@ -74,6 +82,10 @@ async fn main(spawner: Spawner) {
         p.PIN_3.reborrow(),
     )
     .await;
+
+    // Start core 1 as the rasterization coprocessor. Deliberately after the
+    // sleep check: the power-off path never runs with core 1 alive.
+    render3d::core1::spawn(p.CORE1);
 
     // USB logging first so later init steps can report progress.
     let usb_driver = usb::Driver::new(p.USB, Irqs);
@@ -121,11 +133,11 @@ async fn main(spawner: Spawner) {
     backlight.set_brightness(200);
     spawner.spawn(bsp::backlight::backlight_task(backlight).unwrap());
 
-    // RTC's single battery-backed RAM byte holds the high score.
+    // RTC's single battery-backed RAM byte will hold the plant seed.
     let rtc = bsp::rtc::RtcRam::new(p.I2C0, p.PIN_5, p.PIN_4);
 
-    log::info!("entering game");
-    game::run(display, frame, rtc).await;
+    log::info!("entering flora");
+    flora::run(display, frame, rtc, TRI_LIST.take(), TREE.take()).await;
 }
 
 /// Panic strategy for a probe-less board: give a human five seconds to notice

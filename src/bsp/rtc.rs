@@ -52,8 +52,9 @@ impl RtcRam {
         }
     }
 
-    /// Stores one byte; failures are logged and otherwise ignored (the game
+    /// Stores one byte; failures are logged and otherwise ignored (the caller
     /// keeps its in-memory copy either way).
+    #[allow(dead_code, reason = "seed persistence lands with the growth sim")]
     pub fn write(&mut self, value: u8) {
         if let Err(e) = self.i2c.write(RTC_ADDR, &[REG_RAM_BYTE, value]) {
             log::warn!("RTC RAM write failed: {:?}", e);

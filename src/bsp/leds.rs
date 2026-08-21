@@ -13,6 +13,7 @@ use embassy_time::Timer;
 
 /// A lighting pattern request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "framework cue set; each app uses a subset")]
 pub enum LedCue {
     /// Everything off.
     Off,
