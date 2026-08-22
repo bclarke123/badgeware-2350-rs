@@ -21,14 +21,25 @@ use crate::bsp::display::HEIGHT;
 const HALF_PX: i32 = 0x8000;
 
 /// Clears a framebuffer half to a vertical gradient (`clear_top` at y=0 to
-/// `clear_bottom` at the bottom) and draws `list` back-to-front.
+/// `clear_bottom` at the bottom) and draws two independently sorted lists
+/// back-to-front by merge-walking them (each core builds and sorts its own
+/// list during the parallel geometry phase; merging here costs one compare
+/// per triangle instead of a copy + re-sort).
 ///
 /// The gradient costs almost nothing in column-major storage: every column is
 /// identical, so one 240-pixel column is computed and block-copied per column.
 ///
 /// `x0..x1` is the half's absolute column range; `half` must be exactly
 /// `(x1 - x0) * HEIGHT * 2` bytes.
-pub fn draw_list(list: &TriList, half: &mut [u8], x0: i32, x1: i32, clear_top: u16, clear_bottom: u16) {
+pub fn draw_lists(
+    a: &TriList,
+    b: &TriList,
+    half: &mut [u8],
+    x0: i32,
+    x1: i32,
+    clear_top: u16,
+    clear_bottom: u16,
+) {
     debug_assert_eq!(half.len(), ((x1 - x0) as usize) * HEIGHT * 2);
 
     // Ordered (Bayer 4x4) dithering hides the banding a 5/6-bit gradient
@@ -68,7 +79,21 @@ pub fn draw_list(list: &TriList, half: &mut [u8], x0: i32, x1: i32, clear_top: u
         col.copy_from_slice(&columns[x & 3]);
     }
 
-    for tri in &list.tris[..list.len] {
+    // Merge-walk the two depth-sorted lists, farthest triangle first.
+    let (mut i, mut j) = (0, 0);
+    while i < a.len && j < b.len {
+        if a.tris[i].depth >= b.tris[j].depth {
+            draw_tri(&a.tris[i], half, x0, x1);
+            i += 1;
+        } else {
+            draw_tri(&b.tris[j], half, x0, x1);
+            j += 1;
+        }
+    }
+    for tri in &a.tris[i..a.len] {
+        draw_tri(tri, half, x0, x1);
+    }
+    for tri in &b.tris[j..b.len] {
         draw_tri(tri, half, x0, x1);
     }
 }

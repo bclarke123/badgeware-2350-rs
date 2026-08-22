@@ -17,6 +17,8 @@
 //! * **UP / DOWN** — zoom
 
 pub mod anim;
+pub mod birds;
+pub mod terrain;
 pub mod tree;
 
 use embassy_time::{Duration, Instant};
@@ -28,9 +30,11 @@ use crate::bsp::display::{Display, WIDTH};
 use crate::bsp::leds::{cue, LedCue};
 use crate::bsp::rtc::RtcRam;
 use crate::gfx::FrameBuffer;
-use crate::render3d::math::{fast_sin, v3, Camera, Mat34, Vec3};
-use crate::render3d::{core1, tint, ListBuilder, MeshTri, TriList};
-use anim::{lerp_color, Timeline};
+use crate::render3d::math::{fast_sin, v3, Camera};
+use crate::render3d::{core1, ListBuilder, MeshTri, TriList};
+use anim::{ease_in_cubic, lerp_color, Timeline};
+use birds::Flock;
+use terrain::Terrain;
 use tree::Tree;
 
 /// Runs the plant sim forever; owns the display, framebuffer, RTC, and the
@@ -40,12 +44,15 @@ pub async fn run(
     mut frame: FrameBuffer,
     mut rtc: RtcRam,
     tri_list: &'static mut TriList,
+    tri_list_b: &'static mut TriList,
     the_tree: &'static mut Tree,
+    the_terrain: &'static mut Terrain,
 ) -> ! {
     // The badge's tree is whatever seed the RTC remembers (any byte is valid).
     let mut seed = u32::from(rtc.read().unwrap_or(42));
     log::info!("growing tree from seed {}", seed);
     the_tree.generate(seed);
+    the_terrain.generate();
     let mut growth = Timeline::new(Duration::from_millis(tree::TOTAL_GROW_MS));
 
     let mut camera = Camera {
@@ -63,7 +70,9 @@ pub async fn run(
             h ^= h >> 17;
             h ^= h << 5;
             let sx = (h % 320) as i32;
-            let sy = ((h >> 9) % 130) as i32;
+            // Spread down toward the horizon (~y 175 at default pitch/zoom);
+            // the tree and ground occlude any that land behind them.
+            let sy = ((h >> 9) % 175) as i32;
             let phase = ((h >> 17) % 256) as f32 / 40.0;
             *star = (sx, sy, phase);
         }
@@ -72,9 +81,16 @@ pub async fn run(
     let mut orbiting = true;
     let boot = Instant::now();
     let mut last_frame = Instant::now();
+    let mut flock = Flock::new();
     // Desk-art mode: replant on a timer, postponed by any manual (re)growth.
     const REGROW_EVERY: Duration = Duration::from_secs(60);
+    /// The old tree eases (in-cubic) into the ground over the first half of
+    /// this window; the second half is a beat of empty ground before the new
+    /// tree starts to grow.
+    const DESPAWN: Duration = Duration::from_millis(600);
     let mut next_regrow = Instant::now() + REGROW_EVERY;
+    // A pending replant: the seed to plant once the despawn shrink finishes.
+    let mut despawn: Option<(Timeline, u32)> = None;
 
     const LOG_FRAMES: u32 = 120;
     let (mut sum_geom, mut sum_raster) = (0u64, 0u64);
@@ -86,17 +102,13 @@ pub async fn run(
             if let ButtonEvent::Pressed(button) = event {
                 match button {
                     Button::A => {
-                        seed = embassy_rp::clocks::RoscRng.next_u32() & 0xff;
-                        rtc.write(seed as u8);
-                        the_tree.generate(seed);
-                        growth = Timeline::new(Duration::from_millis(tree::TOTAL_GROW_MS));
-                        next_regrow = Instant::now() + REGROW_EVERY;
+                        let new_seed = embassy_rp::clocks::RoscRng.next_u32() & 0xff;
+                        despawn = Some((Timeline::new(DESPAWN), new_seed));
                         cue(LedCue::Celebrate);
-                        log::info!("new seed {}", seed);
                     }
                     Button::B => {
-                        growth = Timeline::new(Duration::from_millis(tree::TOTAL_GROW_MS));
-                        next_regrow = Instant::now() + REGROW_EVERY;
+                        // Replay: despawn and regrow the same seed.
+                        despawn = Some((Timeline::new(DESPAWN), seed));
                         cue(LedCue::Blink);
                     }
                     Button::C => {
@@ -111,13 +123,26 @@ pub async fn run(
         }
 
         // ---- Desk-art auto-replant (silent: no LED flash on the timer) ----
-        if Instant::now() >= next_regrow {
-            seed = embassy_rp::clocks::RoscRng.next_u32() & 0xff;
-            rtc.write(seed as u8);
-            the_tree.generate(seed);
-            growth = Timeline::new(Duration::from_millis(tree::TOTAL_GROW_MS));
-            next_regrow = Instant::now() + REGROW_EVERY;
-            log::info!("auto seed {}", seed);
+        if Instant::now() >= next_regrow && despawn.is_none() {
+            let new_seed = embassy_rp::clocks::RoscRng.next_u32() & 0xff;
+            despawn = Some((Timeline::new(DESPAWN), new_seed));
+            log::info!("auto seed {}", new_seed);
+        }
+
+        // ---- Despawn: shrink the old tree, then plant the pending seed ----
+        let mut tree_scale = 1.0;
+        if let Some((timeline, pending)) = &despawn {
+            if timeline.finished() {
+                seed = *pending;
+                rtc.write(seed as u8);
+                the_tree.generate(seed);
+                growth = Timeline::new(Duration::from_millis(tree::TOTAL_GROW_MS));
+                next_regrow = Instant::now() + REGROW_EVERY;
+                despawn = None;
+            } else {
+                // Shrink over the first half, hold at zero for the second.
+                tree_scale = 1.0 - ease_in_cubic((timeline.progress() * 2.0).min(1.0));
+            }
         }
 
         // ---- Animate: slow auto-orbit (pausable) + wind clock ----
@@ -132,30 +157,52 @@ pub async fn run(
         // ---- Sky cycle ----
         let phase = (time_s % DAY_CYCLE_S) / DAY_CYCLE_S;
         let (sky_top, sky_bottom, night) = sky_for(phase);
+        flock.update(dt, time_s, night <= 0.0);
 
-        // ---- Geometry (core 0) ----
+        // ---- Geometry (both cores: core 1 takes the odd half of the tree,
+        // core 0 the even half plus all scenery, each into its own list) ----
         let t0 = Instant::now();
         let view = camera.view();
+        let growth_elapsed = growth.elapsed();
+        core1::dispatch(core1::Job::Geom(core1::GeomJob {
+            tree: core::ptr::from_ref(the_tree),
+            view,
+            growth_elapsed,
+            time_s,
+            scale: tree_scale,
+            out: core::ptr::from_mut(tri_list_b),
+        }));
         let mut builder = ListBuilder::new_view_space(tri_list);
         push_stars(&mut builder, &stars, night, time_s, sky_top);
-        push_ground(&view, &mut builder, tint(GROUND, 1.0 - 0.55 * night));
-        the_tree.emit(&view, &growth, time_s, &mut builder);
+        flock.emit(time_s, &mut builder);
+        the_terrain.emit(&view, 1.0 - 0.55 * night, &mut builder);
+        the_tree.emit(&view, growth_elapsed, time_s, tree_scale, 0, &mut builder);
         builder.finish();
+        join_or_panic("geom").await;
         let t_geom = t0.elapsed().as_micros();
 
-        // ---- Rasterize ----
+        // ---- Rasterize (fork-join again over the two sorted lists) ----
         let t1 = Instant::now();
         let top = RawU16::from(sky_top).into_inner();
         let bottom = RawU16::from(sky_bottom).into_inner();
         let (left, right) = frame.split_halves();
-        core1::dispatch(core1::RasterJob {
-            tris: core::ptr::from_ref(tri_list),
+        core1::dispatch(core1::Job::Raster(core1::RasterJob {
+            tris_a: core::ptr::from_ref(tri_list),
+            tris_b: core::ptr::from_ref(tri_list_b),
             fb_half: right.as_mut_ptr(),
             clear_top: top,
             clear_bottom: bottom,
-        });
-        crate::render3d::raster::draw_list(tri_list, left, 0, (WIDTH / 2) as i32, top, bottom);
-        core1::join().await;
+        }));
+        crate::render3d::raster::draw_lists(
+            tri_list,
+            tri_list_b,
+            left,
+            0,
+            (WIDTH / 2) as i32,
+            top,
+            bottom,
+        );
+        join_or_panic("raster").await;
         let t_raster = t1.elapsed().as_micros();
 
         // ---- Present (vsync'd) ----
@@ -170,10 +217,22 @@ pub async fn run(
                 "frame: geom {}us raster {}us ({} tris)",
                 sum_geom / u64::from(frames),
                 sum_raster / u64::from(frames),
-                tri_list.len,
+                tri_list.len + tri_list_b.len,
             );
             (sum_geom, sum_raster, frames) = (0, 0, 0);
         }
+    }
+}
+
+/// Waits for core 1's DONE; a silent core-1 wedge becomes a loud, reflashable
+/// panic (BOOTSEL) with the failing stage in the log instead of a freeze.
+async fn join_or_panic(stage: &str) {
+    if embassy_time::with_timeout(Duration::from_millis(250), core1::join())
+        .await
+        .is_err()
+    {
+        log::error!("core1 join timeout during {}", stage);
+        panic!("core1 wedged");
     }
 }
 
@@ -181,7 +240,7 @@ pub async fn run(
 const DAY_CYCLE_S: f32 = 600.0;
 
 /// Number of stars in the night sky.
-const STAR_COUNT: usize = 40;
+const STAR_COUNT: usize = 20;
 
 /// Sky keyframes around the day cycle: (top, bottom) at phases 0, .25, .5, .75.
 /// Dusk blue, sunset orange glow, deep night purple, pink dawn.
@@ -242,22 +301,5 @@ fn push_stars(
     }
 }
 
-/// Ground base color; night dimming is applied by the caller per frame.
-const GROUND: Rgb565 = Rgb565::new(4, 13, 4); // pre-baked ~0.55 sun intensity
-
-/// A simple ground plane under the tree (world space, wound +y outward).
-fn push_ground(view: &Mat34, out: &mut ListBuilder<'_>, color: Rgb565) {
-    let y = -0.95;
-    let e = 2.2;
-    let corners = [
-        v3(-e, y, -e),
-        v3(-e, y, e),
-        v3(e, y, e),
-        v3(e, y, -e),
-    ];
-    let p: [Vec3; 4] = corners.map(|c| view.transform_point(c));
-    out.push(MeshTri { v: [p[0], p[1], p[2]], color });
-    out.push(MeshTri { v: [p[0], p[2], p[3]], color });
-}
 
 // Rust guideline compliant 2026-08-21

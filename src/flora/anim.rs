@@ -12,6 +12,11 @@ use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 
+/// Accelerating from zero: `t^3`.
+pub fn ease_in_cubic(t: f32) -> f32 {
+    t * t * t
+}
+
 /// Decelerating to one: `1 - (1-t)^3`.
 pub fn ease_out_cubic(t: f32) -> f32 {
     let u = 1.0 - t;
@@ -49,6 +54,7 @@ pub fn scale_rect(rect: Rectangle, s: f32) -> Rectangle {
 }
 
 /// A wall-clock animation window.
+#[derive(Clone, Copy)]
 pub struct Timeline {
     start: Instant,
     duration: Duration,
@@ -75,18 +81,26 @@ impl Timeline {
         self.start.elapsed() >= self.duration
     }
 
-    /// Progress of a sub-window starting `delay` in and lasting `length`.
+    /// Time elapsed since the timeline started.
     ///
-    /// Returns 0.0 before the sub-window opens and 1.0 after it closes; used
-    /// for staggered per-element animations inside one timeline.
-    pub fn segment(&self, delay: Duration, length: Duration) -> f32 {
-        let elapsed = self.start.elapsed();
-        if elapsed <= delay {
-            return 0.0;
-        }
-        let local = (elapsed - delay).as_micros() as f32;
-        (local / length.as_micros() as f32).clamp(0.0, 1.0)
+    /// Sampled once per frame on core 0 and passed by value to emitters, so
+    /// core 1 never reads the clock (and both cores animate from the exact
+    /// same instant).
+    pub fn elapsed(&self) -> Duration {
+        self.start.elapsed()
     }
+}
+
+/// Progress of a sub-window starting `delay` into `elapsed`, lasting `length`.
+///
+/// Returns 0.0 before the sub-window opens and 1.0 after it closes; used for
+/// staggered per-element animations against one shared elapsed sample.
+pub fn segment_progress(elapsed: Duration, delay: Duration, length: Duration) -> f32 {
+    if elapsed <= delay {
+        return 0.0;
+    }
+    let local = (elapsed - delay).as_micros() as f32;
+    (local / length.as_micros() as f32).clamp(0.0, 1.0)
 }
 
 // Rust guideline compliant 2026-08-21

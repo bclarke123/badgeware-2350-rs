@@ -20,12 +20,15 @@ use embedded_graphics::pixelcolor::Rgb565;
 use heapless::Vec;
 use crate::render3d::math::{fast_cos, fast_sin};
 
-use super::anim::{ease_out_cubic, Timeline};
+use super::anim::{ease_out_cubic, segment_progress};
 use crate::render3d::math::{v3, Mat34, Vec3};
 use crate::render3d::{tint, ListBuilder, MeshTri};
 
 /// Deepest branch generation (trunk is depth 0; leaves attach at this depth).
 const MAX_DEPTH: u8 = 5;
+
+/// Where the trunk meets the ground; despawn scaling shrinks toward here.
+const TREE_BASE: Vec3 = v3(0.0, -0.95, 0.0);
 
 /// Branch capacity; generation prunes silently when full (a bushy seed just
 /// gets a slightly thinner tree).
@@ -102,7 +105,7 @@ impl Tree {
         let trunk_len = rng.range(0.55, 0.85);
         let trunk_radius = 0.075 * rng.range(0.9, 1.15);
         self.grow(
-            v3(0.0, -0.95, 0.0),
+            TREE_BASE,
             v3(0.0, 1.0, 0.0),
             trunk_len,
             trunk_radius,
@@ -201,9 +204,32 @@ impl Tree {
     /// `out` must be a view-space builder: ribbons and leaf billboards are
     /// camera-facing, so this function does the view transform itself and
     /// pushes view-space triangles with pre-baked colors.
-    pub fn emit(&self, view: &Mat34, growth: &Timeline, time_s: f32, out: &mut ListBuilder<'_>) {
-        for b in &self.branches {
-            let t = ease_out_cubic(growth.segment(
+    /// `scale` (0..=1) shrinks the whole tree toward its base — the despawn
+    /// animation. Positions contract toward [`TREE_BASE`], which also quiets
+    /// the wind sway naturally (its amplitude grows with height).
+    /// `parity` selects every other branch/leaf (0 or 1) so the two cores can
+    /// each emit half of the tree into their own list.
+    pub fn emit(
+        &self,
+        view: &Mat34,
+        growth_elapsed: Duration,
+        time_s: f32,
+        scale: f32,
+        parity: usize,
+        out: &mut ListBuilder<'_>,
+    ) {
+        if scale <= 0.01 {
+            return;
+        }
+        let shrink = |p: Vec3| TREE_BASE.add(p.sub(TREE_BASE).scale(scale));
+        for (_, b) in self
+            .branches
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i & 1 == parity)
+        {
+            let t = ease_out_cubic(segment_progress(
+                growth_elapsed,
                 Duration::from_millis(u64::from(b.depth) * GROW_STAGGER_MS),
                 Duration::from_millis(GROW_LEN_MS),
             ));
@@ -211,8 +237,8 @@ impl Tree {
                 continue;
             }
             let tip = b.start.add(b.end.sub(b.start).scale(t));
-            let p0 = view.transform_point(sway(b.start, time_s));
-            let p1 = view.transform_point(sway(tip, time_s));
+            let p0 = view.transform_point(sway(shrink(b.start), time_s));
+            let p1 = view.transform_point(sway(shrink(tip), time_s));
 
             // Camera-facing ribbon: side is perpendicular to both the branch
             // axis and the line of sight, so the quad always shows its face.
@@ -223,8 +249,8 @@ impl Tree {
                 side = v3(1.0, 0.0, 0.0); // camera exactly on the axis
             }
             // Radius eases in with growth so twigs sprout thin.
-            let r0 = b.r0 * (0.3 + 0.7 * t);
-            let r1 = b.r1 * (0.3 + 0.7 * t);
+            let r0 = b.r0 * (0.3 + 0.7 * t) * scale;
+            let r1 = b.r1 * (0.3 + 0.7 * t) * scale;
             let color = bark_color(b.depth);
             push_quad(
                 out,
@@ -237,17 +263,23 @@ impl Tree {
         }
 
         let leaf_delay_base = u64::from(MAX_DEPTH + 1) * GROW_STAGGER_MS;
-        for leaf in &self.leaves {
+        for (_, leaf) in self
+            .leaves
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i & 1 == parity)
+        {
             let delay = leaf_delay_base + (leaf.phase * 900.0) as u64;
-            let t = ease_out_cubic(growth.segment(
+            let t = ease_out_cubic(segment_progress(
+                growth_elapsed,
                 Duration::from_millis(delay),
                 Duration::from_millis(LEAF_LEN_MS),
             ));
             if t <= 0.0 {
                 continue;
             }
-            let p = view.transform_point(sway(leaf.pos, time_s));
-            let s = leaf.size * t;
+            let p = view.transform_point(sway(shrink(leaf.pos), time_s));
+            let s = leaf.size * t * scale;
             // Gentle flutter on top of the leaf's fixed orientation.
             let angle = leaf.angle + 0.18 * fast_sin(time_s * 2.1 + leaf.phase * 6.3);
             if leaf.blossom {
@@ -308,7 +340,7 @@ fn rotator(p: Vec3, angle: f32) -> impl Fn(f32, f32, f32) -> Vec3 {
 /// Wind: a smooth displacement field over height and time. Being a pure
 /// function of position, parent tips and child bases displace identically —
 /// joints cannot separate.
-fn sway(p: Vec3, time_s: f32) -> Vec3 {
+pub(super) fn sway(p: Vec3, time_s: f32) -> Vec3 {
     // Amplitude grows with height above the roots so the trunk barely moves.
     let lever = (p.y + 0.95).max(0.0);
     let a = 0.022 * lever;
@@ -342,10 +374,10 @@ fn basis(dir: Vec3) -> (Vec3, Vec3) {
 }
 
 /// Tiny deterministic PRNG (xorshift32) for repeatable trees per seed.
-struct XorShift(u32);
+pub(super) struct XorShift(pub(super) u32);
 
 impl XorShift {
-    fn next(&mut self) -> u32 {
+    pub(super) fn next(&mut self) -> u32 {
         let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 17;
@@ -355,11 +387,11 @@ impl XorShift {
     }
 
     /// Uniform-ish in [0, 1).
-    fn unit(&mut self) -> f32 {
+    pub(super) fn unit(&mut self) -> f32 {
         (self.next() >> 8) as f32 / 16_777_216.0
     }
 
-    fn range(&mut self, lo: f32, hi: f32) -> f32 {
+    pub(super) fn range(&mut self, lo: f32, hi: f32) -> f32 {
         lo + (hi - lo) * self.unit()
     }
 }
