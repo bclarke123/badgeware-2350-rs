@@ -3,11 +3,13 @@
 //!
 //! The RTC has a single general-purpose `RAM_byte` register that persists as
 //! long as the chip is powered, i.e. across power-off and reflashing, but not
-//! across battery disconnection or full drain. The high score lives there
-//! until level 255 becomes achievable.
+//! across battery disconnection or full drain. It held the Simon high score
+//! and later the tree seed; both uses have since been retired.
 //!
 //! `POWER_EN` (GPIO41) must be high for the I2C bus/RTC to respond; `main`
 //! asserts it at boot. Timekeeping and alarm-wake support can grow here later.
+
+#![allow(dead_code, reason = "dormant framework driver: unused since seed persistence was retired, kept for RTC timekeeping/alarm work")]
 
 use embassy_rp::i2c::{Blocking, Config, I2c};
 use embassy_rp::peripherals::{I2C0, PIN_4, PIN_5};

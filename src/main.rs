@@ -140,11 +140,8 @@ async fn main(spawner: Spawner) {
     backlight.set_brightness(200);
     spawner.spawn(bsp::backlight::backlight_task(backlight).unwrap());
 
-    // RTC's single battery-backed RAM byte will hold the plant seed.
-    let rtc = bsp::rtc::RtcRam::new(p.I2C0, p.PIN_5, p.PIN_4);
-
     log::info!("entering flora");
-    flora::run(display, frame, rtc, TRI_LIST.take(), TRI_LIST_B.take(), TREE.take(), TERRAIN.take()).await;
+    flora::run(display, frame, TRI_LIST.take(), TRI_LIST_B.take(), TREE.take(), TERRAIN.take()).await;
 }
 
 /// Fault strategy matches the panic strategy: any hard fault on either core

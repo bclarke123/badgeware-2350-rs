@@ -2,16 +2,16 @@
 //!
 //! Each seed byte grows a different deterministic tree — recursive branches as
 //! camera-facing ribbons, billboard leaves (pink blossoms on some seeds), wind
-//! sway, staggered cubic-eased growth from a bare trunk to full bloom. The
-//! seed lives in the RTC's battery-backed RAM byte, so the badge regrows *its*
-//! tree after power-off.
+//! sway, staggered cubic-eased growth from a bare trunk to full bloom. Seeds
+//! are random at boot and on every replant — an always-on gallery has no need
+//! to remember which tree it was showing.
 //!
 //! Controls:
 //! Left alone, the badge is a desk sculpture: every minute it plants a new
 //! seed and grows a fresh tree (manual input postpones the cycle), while the
 //! sky drifts through a ten-minute day: dusk, sunset, starry night, dawn.
 //!
-//! * **A** — new random seed (saved to the RTC), regrow
+//! * **A** — plant a new random seed
 //! * **B** — replay growth of the current tree
 //! * **C** — pause/resume the auto-orbit (pick a favorite view, watch the sway)
 //! * **UP / DOWN** — zoom
@@ -28,7 +28,6 @@ use embedded_graphics::pixelcolor::Rgb565;
 use crate::bsp::buttons::{Button, ButtonEvent, EVENTS};
 use crate::bsp::display::{Display, WIDTH};
 use crate::bsp::leds::{cue, LedCue};
-use crate::bsp::rtc::RtcRam;
 use crate::gfx::FrameBuffer;
 use crate::render3d::math::{fast_sin, v3, Camera};
 use crate::render3d::{core1, ListBuilder, MeshTri, TriList};
@@ -37,19 +36,17 @@ use birds::Flock;
 use terrain::Terrain;
 use tree::Tree;
 
-/// Runs the plant sim forever; owns the display, framebuffer, RTC, and the
-/// statically allocated tree + triangle list.
+/// Runs the plant sim forever; owns the display, framebuffer, and the
+/// statically allocated tree, terrain, and triangle lists.
 pub async fn run(
     mut display: Display,
     mut frame: FrameBuffer,
-    mut rtc: RtcRam,
     tri_list: &'static mut TriList,
     tri_list_b: &'static mut TriList,
     the_tree: &'static mut Tree,
     the_terrain: &'static mut Terrain,
 ) -> ! {
-    // The badge's tree is whatever seed the RTC remembers (any byte is valid).
-    let mut seed = u32::from(rtc.read().unwrap_or(42));
+    let mut seed = embassy_rp::clocks::RoscRng.next_u32() & 0xff;
     log::info!("growing tree from seed {}", seed);
     the_tree.generate(seed);
     the_terrain.generate();
@@ -134,7 +131,6 @@ pub async fn run(
         if let Some((timeline, pending)) = &despawn {
             if timeline.finished() {
                 seed = *pending;
-                rtc.write(seed as u8);
                 the_tree.generate(seed);
                 growth = Timeline::new(Duration::from_millis(tree::TOTAL_GROW_MS));
                 next_regrow = Instant::now() + REGROW_EVERY;

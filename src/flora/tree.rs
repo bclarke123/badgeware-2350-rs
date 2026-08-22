@@ -31,10 +31,13 @@ const MAX_DEPTH: u8 = 5;
 const TREE_BASE: Vec3 = v3(0.0, -0.95, 0.0);
 
 /// Branch capacity; generation prunes silently when full (a bushy seed just
-/// gets a slightly thinner tree).
-pub const MAX_BRANCHES: usize = 192;
+/// gets a slightly thinner tree). Sized so the densest species (the bush,
+/// ~240 branches / ~670 leaves wanted) fits without pruning: worst case
+/// ~1,930 triangles ~= 15.2 ms/frame by measured marginal cost — inside the
+/// 16.7 ms vsync budget.
+pub const MAX_BRANCHES: usize = 256;
 /// Leaf capacity, pruned the same way.
-pub const MAX_LEAVES: usize = 384;
+pub const MAX_LEAVES: usize = 768;
 
 /// Per-depth growth stagger and per-branch growth duration.
 const GROW_STAGGER_MS: u64 = 850;
@@ -47,10 +50,21 @@ pub const TOTAL_GROW_MS: u64 =
     (MAX_DEPTH as u64 + 1) * GROW_STAGGER_MS + GROW_LEN_MS + LEAF_LEN_MS;
 
 /// Per-seed shape parameters rolled once in [`Tree::generate`].
+///
+/// Three kinds share one parameter set: sakura (pink blossoms), the classic
+/// green tree, and the bush — a shorter, wider, denser green (blossoms cost 4
+/// triangles to a leaf's 2, so green kinds can afford extra foliage; the
+/// branch/leaf capacity caps bound the worst case regardless).
 struct Species {
     blossoms: bool,
     /// Branch-pitch multiplier: <1.0 tall and narrow, >1.0 wide and squat.
     spread: f32,
+    /// Chance of a third child per branch node.
+    extra_child_p: f32,
+    /// Minimum leaves per twig (a coin flip adds one more).
+    leaves_per_twig: u32,
+    /// Trunk length multiplier (bushes start low).
+    trunk_scale: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -95,14 +109,40 @@ impl Tree {
         // Knuth multiplicative hash spreads consecutive seed bytes into very
         // different trees; |1 keeps xorshift out of its zero fixed point.
         let mut rng = XorShift(seed.wrapping_mul(2654435761).wrapping_add(0x9e37_79b9) | 1);
-        // Per-seed species character: sakura-ish seeds carry blossoms, and
-        // silhouettes range from tall-and-narrow to wide-and-squat.
-        let species = Species {
-            blossoms: rng.unit() < 0.4,
-            // <1.0 = upright poplar-ish, >1.0 = spreading oak-ish.
-            spread: rng.range(0.75, 1.4),
+        // Per-seed species character; within each kind, silhouettes still
+        // range tall-and-narrow to wide-and-squat via `spread`.
+        let roll = rng.unit();
+        let species = if roll < 0.35 {
+            // Sakura: pink blossoms, classic shape.
+            Species {
+                blossoms: true,
+                spread: rng.range(0.75, 1.4),
+                extra_child_p: 0.35,
+                leaves_per_twig: 3,
+                trunk_scale: 1.0,
+            }
+        } else if roll < 0.7 {
+            // Classic green tree.
+            Species {
+                blossoms: false,
+                spread: rng.range(0.75, 1.4),
+                extra_child_p: 0.35,
+                leaves_per_twig: 3,
+                trunk_scale: 1.0,
+            }
+        } else {
+            // Bush: low trunk, wide and dense green crown.
+            Species {
+                blossoms: false,
+                spread: rng.range(1.1, 1.55),
+                // 0.65 measured ~1,950 tris = 16.5 ms — the exact frame
+                // budget; 0.55 sheds ~150 tris for reliable 60 fps headroom.
+                extra_child_p: 0.55,
+                leaves_per_twig: 4,
+                trunk_scale: 0.72,
+            }
         };
-        let trunk_len = rng.range(0.55, 0.85);
+        let trunk_len = rng.range(0.55, 0.85) * species.trunk_scale;
         let trunk_radius = 0.075 * rng.range(0.9, 1.15);
         self.grow(
             TREE_BASE,
@@ -139,7 +179,7 @@ impl Tree {
         }
 
         if depth == MAX_DEPTH {
-            let leaves = 3 + (rng.next() % 2) as usize;
+            let leaves = (species.leaves_per_twig + rng.next() % 2) as usize;
             for _ in 0..leaves {
                 let jitter = v3(
                     rng.range(-0.08, 0.08),
@@ -170,8 +210,13 @@ impl Tree {
             return;
         }
 
-        // 2-3 children fanned around the parent direction.
-        let children = if depth == 0 { 3 } else { 2 + u32::from(rng.unit() < 0.35) };
+        // 2-3 children fanned around the parent direction; denser kinds roll
+        // the third child more often.
+        let children = if depth == 0 {
+            3
+        } else {
+            2 + u32::from(rng.unit() < species.extra_child_p)
+        };
         let (u, v) = basis(dir);
         let azimuth0 = rng.range(0.0, core::f32::consts::TAU);
         for k in 0..children {
