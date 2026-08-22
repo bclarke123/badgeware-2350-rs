@@ -1,45 +1,63 @@
 # tufty-2350
 
 Rust/[Embassy](https://embassy.dev) firmware for the [Pimoroni Tufty 2350](https://github.com/pimoroni/tufty2350)
-badge: a procedurally grown 3D tree on a dual-core software renderer and a
-custom PIO+DMA display driver. Each seed byte (persisted in the RTC's
-battery-backed RAM) grows a different deterministic tree — recursive ribbon
-branches, billboard leaves (blossoms on some seeds), wind sway, and staggered
-cubic-eased growth from bare trunk to full bloom. A Simon-style memory game
-lived here previously — see git history.
+badge: a procedurally grown 3D tree garden on a dual-core software renderer
+and a custom PIO+DMA display driver. No MicroPython, no interpreter, no heap —
+a single static binary straight on the metal. (A Simon-style memory game lived
+here previously — see git history.)
 
-Left alone it is a desk sculpture: every minute it plants a new seed and grows
-a fresh tree.
+Left alone it is a desk sculpture: every minute the current tree eases back
+into the ground and a new random seed grows in its place — three species
+(pink-blossom sakura, classic green, dense low bush), each deterministic per
+seed, with recursive ribbon branches, billboard leaves, wind sway, and
+staggered cubic-eased growth from bare trunk to full bloom. Around it: a
+gently bumpy meadow, a ten-minute day cycle (dusk → orange sunset → starry
+purple night → pink dawn, Bayer-dithered gradients), twinkling stars that only
+come out after dark, and distant flapping bird silhouettes that cross the sky
+by day. Dense scenes run ~1,700–1,900 triangles at a vsync-locked 60 fps on
+the stock 150 MHz clock.
 
-**Controls**: A = new seed (saved), B = replay growth, C = pause/resume orbit,
-UP/DOWN = zoom, HOME-hold = BOOTSEL, RESET-hold = sleep. Frame timings and
+**Controls**: A = plant a new random seed, B = replay the current tree's
+growth, C = pause/resume the orbit, UP/DOWN = zoom, HOME-hold ~2 s = reboot to
+BOOTSEL, RESET-hold ~1.5 s = sleep (any front button wakes). Frame timings and
 seeds are logged over USB serial.
 
 ## 3D renderer (`src/render3d`)
 
-Flat-shaded triangles, painter's algorithm, per-triangle directional lighting,
-near-plane clipping. Both cores rasterize ("tiled" split): core 0 builds,
-lights, and depth-sorts the frame's triangle list, hands core 1 the right half
-of the framebuffer via an `embassy-sync` Signal handshake (bare loop on core 1,
-no executor), rasterizes the left half itself, joins, and presents. The
-column-major framebuffer makes the two halves contiguous disjoint slices. The
+Flat-shaded triangles, painter's algorithm, near-plane clipping, colors baked
+at generation time. Every frame runs **two fork-joins across both cores**:
+
+1. **Geometry**: core 1 emits the odd half of the tree into its own triangle
+   list and depth-sorts it, while core 0 does the even half plus scenery
+   (terrain, stars, birds) into a second list.
+2. **Raster**: each core clears and draws one half of the framebuffer,
+   merge-walking the two sorted lists (one compare per triangle — no copy, no
+   re-sort). The column-major framebuffer makes the halves contiguous disjoint
+   slices, split at x=160.
+
+Core 1 runs a bare loop (no executor, no clock access) fed jobs through an
+`embassy-sync` Signal handshake; a HardFault handler and a join watchdog turn
+any wedge into a reflashable BOOTSEL reboot instead of a freeze. The
 rasterizer walks triangles column-by-column (f32 setup, 16.16 fixed per-column
-increments) so the hot loop is a sequential byte fill.
+increments) so the hot loop is a sequential byte fill. Trig and square roots
+are fast f32 approximations — `libm`'s f64-internal `sinf` costs microseconds
+per call on the M33's single-precision FPU (measured as a 20x geometry
+slowdown before replacement).
 
 ## Hardware covered
 
 | Subsystem | Support |
 |---|---|
-| RP2350B @ 150 MHz | `embassy-rp` (`rp235xb`) |
+| RP2350B @ 150 MHz, both cores + FPUs | `embassy-rp` (`rp235xb`) |
 | 2.8" 320×240 ST7789, 8-bit 8080 parallel bus | custom PIO+DMA driver (`src/bsp/display.rs`) |
 | 5 front buttons + HOME | debounced event channel (`src/bsp/buttons.rs`) |
 | Backlight (PWM) + phototransistor | auto-brightness (`src/bsp/backlight.rs`) |
 | 4-zone rear LEDs | cue patterns (`src/bsp/leds.rs`) |
 | USB serial logging | `embassy-usb-logger` (`src/bsp/usb.rs`) |
-| PCF85063A RTC | battery-backed RAM byte for persistence (`src/bsp/rtc.rs`) |
-| Dual-core rendering | core 1 rasterization coprocessor (`src/render3d/core1.rs`) |
+| Dual-core rendering | core 1 geometry + raster coprocessor (`src/render3d/core1.rs`) |
 | Sleep / power-off | hold RESET ~1.5 s → POWMAN off, any front button wakes (`src/bsp/power.rs`) |
-| WiFi/BT (RM2), battery gauge, PSRAM | not yet (see notes below) |
+| PCF85063A RTC | dormant driver (`src/bsp/rtc.rs`; held the Simon high score in its one battery-backed RAM byte, now awaiting timekeeping/alarm duty) |
+| WiFi/BT (RM2), battery gauge, PSRAM | not yet (see roadmap) |
 
 ## Building & flashing (no debug probe needed)
 
@@ -55,7 +73,7 @@ Prerequisites: Rust stable with the `thumbv8m.main-none-eabihf` target
 
 2. **Every flash after that:** hold **HOME for 2 seconds** on the running
    firmware to reboot into BOOTSEL, then `cargo run --release` again.
-   A panic also drops the badge back into BOOTSEL after 5 seconds, so it can
+   Panics and hard faults also drop the badge back into BOOTSEL, so it can
    always be reflashed.
 
 Logs: `screen /dev/tty.usbmodem*` (or `tio`); plain-text `log` output over USB CDC.
@@ -75,15 +93,10 @@ math, keeping fills contiguous), and `present` waits for the TE vblank pulse
 before streaming. The ~8 ms write starts ahead of the ~17 ms refresh beam and
 outruns it, so the beam never crosses the write.
 
-Remaining first-hardware-test items:
-
-- Battery bring-up: `POWER_EN` (GPIO41) is asserted first thing in `main`;
-  verify the badge stays on when unplugged from USB.
-- Light-sensor ADC range constants in `src/bsp/backlight.rs`.
-
 ## Roadmap
 
+- 250 MHz overclock (Pimoroni ships the PLL + voltage config for this board)
+  and falling leaves/petals to spend the new budget.
 - WiFi/BT via `cyw43` (RM2 module: WL_ON=23, DATA=24, CS=25, CLK=29).
-- RTC timekeeping + alarm sleep/wake (the chip is wired up in `src/bsp/rtc.rs`;
-  only its RAM byte is used so far).
+- RTC timekeeping + alarm sleep/wake (`src/bsp/rtc.rs` is wired and waiting).
 - Battery gauge (VBAT_SENSE=40, VBUS_DETECT=12).
