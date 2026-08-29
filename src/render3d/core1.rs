@@ -27,18 +27,19 @@ use embassy_rp::peripherals::CORE1;
 use embassy_rp::Peri;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
+use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
+use super::raster::ClearCache;
+use super::texture::Textures;
 use super::{raster, ListBuilder, TriList};
-use crate::bsp::display::{HEIGHT, WIDTH};
+use crate::bsp::display::HEIGHT;
 // Layering note: core1 knows about the tree so the geometry fork-join stays a
 // plain function call on this side; acceptable coupling in a single-app binary.
 use crate::flora::tree::Tree;
 use embassy_time::Duration;
 use crate::render3d::math::Mat34;
 
-/// Bytes in one framebuffer half (the split is at column WIDTH/2).
-pub const HALF_BYTES: usize = (WIDTH / 2) * HEIGHT * 2;
 
 /// A frame work order for core 1.
 #[derive(Clone, Copy)]
@@ -61,18 +62,32 @@ pub struct GeomJob {
     pub out: *mut TriList,
 }
 
-/// Raster fork: clear + draw both sorted lists into the right fb half.
+/// Raster fork: clear + draw both sorted lists into columns `x0..x1`.
+///
+/// Core 1 takes the *left* part of the frame because the presentation DMA
+/// streams columns left to right: it spins on the DMA's `READ_ADDR` until
+/// the transfer has passed its part, then starts — a few ms before core 0,
+/// which must wait for the whole transfer before it can touch the right
+/// part. The split column is chosen to balance that head start.
 #[derive(Clone, Copy)]
 pub struct RasterJob {
     /// The frame's two sorted triangle lists ('static, frozen until `DONE`).
     pub tris_a: *const TriList,
     pub tris_b: *const TriList,
-    /// Start of the right framebuffer half, [`HALF_BYTES`] long, exclusively
-    /// core 1's between `JOB` and `DONE`.
-    pub fb_half: *mut u8,
+    /// Start of core 1's framebuffer part (columns `x0..x1`, contiguous),
+    /// exclusively core 1's between the DMA passing it and `DONE`.
+    pub fb_part: *mut u8,
+    pub x0: i32,
+    pub x1: i32,
+    /// The DMA channel's `READ_ADDR` register and the address it must reach
+    /// before `fb_part` may be written.
+    pub dma_read_addr: *const u32,
+    pub wait_until: u32,
     /// Sky gradient for the clear pass (top and bottom RGB565).
     pub clear_top: u16,
     pub clear_bottom: u16,
+    /// The boot-generated shade maps ('static, immutable after generation).
+    pub textures: *const Textures,
 }
 
 // SAFETY: the raw pointers refer to 'static allocations whose exclusive use
@@ -82,6 +97,11 @@ unsafe impl Send for Job {}
 
 /// Core 0 -> core 1: a frame's rasterization job.
 pub static JOB: Signal<CriticalSectionRawMutex, Job> = Signal::new();
+/// Core 1's raster timing for the last job, in microseconds from receiving
+/// it: how long it waited for the DMA, then how long it drew. Written by
+/// core 1 before `DONE`, read by core 0 after joining.
+pub static RASTER_WAIT_US: AtomicU32 = AtomicU32::new(0);
+pub static RASTER_DRAW_US: AtomicU32 = AtomicU32::new(0);
 /// Core 1 -> core 0: the job is complete.
 pub static DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
@@ -110,6 +130,7 @@ pub async fn join() {
 }
 
 fn worker() -> ! {
+    let mut clear = ClearCache::new();
     loop {
         // No executor on this core: poll with WFE naps. Spurious wakeups
         // (any interrupt or event) just re-poll; the event register is sticky
@@ -138,18 +159,31 @@ fn worker() -> ! {
                 let tris_a = unsafe { &*r.tris_a };
                 // SAFETY: as above.
                 let tris_b = unsafe { &*r.tris_b };
-                // SAFETY: as above; fb_half is the right half from
-                // split_at_mut with exactly HALF_BYTES bytes.
-                let half = unsafe { core::slice::from_raw_parts_mut(r.fb_half, HALF_BYTES) };
+                let t0 = embassy_rp::pac::TIMER0.timerawl().read();
+                // Wait for the presentation DMA to move past our columns.
+                // SAFETY: a live DMA register; reading it has no side effect.
+                while unsafe { core::ptr::read_volatile(r.dma_read_addr) } < r.wait_until {}
+                let t1 = embassy_rp::pac::TIMER0.timerawl().read();
+                let len = (r.x1 - r.x0) as usize * HEIGHT * 2;
+                // SAFETY: as above; fb_part is core 1's columns from
+                // split_at_mut, exactly `len` bytes, now past the DMA.
+                let part = unsafe { core::slice::from_raw_parts_mut(r.fb_part, len) };
+                // SAFETY: as above; generated once at boot, read-only since.
+                let textures = unsafe { &*r.textures };
                 raster::draw_lists(
                     tris_a,
                     tris_b,
-                    half,
-                    (WIDTH / 2) as i32,
-                    WIDTH as i32,
+                    part,
+                    r.x0,
+                    r.x1,
                     r.clear_top,
                     r.clear_bottom,
+                    textures,
+                    &mut clear,
                 );
+                let t2 = embassy_rp::pac::TIMER0.timerawl().read();
+                RASTER_WAIT_US.store(t1.wrapping_sub(t0), Ordering::Relaxed);
+                RASTER_DRAW_US.store(t2.wrapping_sub(t1), Ordering::Relaxed);
             }
         }
 
@@ -159,4 +193,4 @@ fn worker() -> ! {
     }
 }
 
-// Rust guideline compliant 2026-08-21
+// Rust guideline compliant 2026-08-29

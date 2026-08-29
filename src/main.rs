@@ -54,7 +54,7 @@ bind_interrupts!(struct Irqs {
 /// never on the stack).
 static FRAMEBUFFER: ConstStaticCell<[u8; FB_BYTES]> = ConstStaticCell::new([0; FB_BYTES]);
 
-/// The two 3D triangle lists (32 KiB each, `.bss`): during the parallel
+/// The two 3D triangle lists (64 KiB each, `.bss`): during the parallel
 /// geometry phase each core fills and sorts its own.
 static TRI_LIST: ConstStaticCell<render3d::TriList> =
     ConstStaticCell::new(render3d::TriList::EMPTY);
@@ -67,6 +67,11 @@ static TREE: ConstStaticCell<flora::tree::Tree> = ConstStaticCell::new(flora::tr
 /// The generated ground patch (also static, regenerated with each seed).
 static TERRAIN: ConstStaticCell<flora::terrain::Terrain> =
     ConstStaticCell::new(flora::terrain::Terrain::EMPTY);
+
+/// Leaf and blossom shade maps, baked once at boot and then read by both
+/// cores' rasterizers.
+static TEXTURES: ConstStaticCell<render3d::texture::Textures> =
+    ConstStaticCell::new(render3d::texture::Textures::EMPTY);
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -140,8 +145,20 @@ async fn main(spawner: Spawner) {
     backlight.set_brightness(200);
     spawner.spawn(bsp::backlight::backlight_task(backlight).unwrap());
 
+    let textures = TEXTURES.take();
+    textures.generate();
+
     log::info!("entering flora");
-    flora::run(display, frame, TRI_LIST.take(), TRI_LIST_B.take(), TREE.take(), TERRAIN.take()).await;
+    flora::run(
+        display,
+        frame,
+        TRI_LIST.take(),
+        TRI_LIST_B.take(),
+        TREE.take(),
+        TERRAIN.take(),
+        textures,
+    )
+    .await;
 }
 
 /// Fault strategy matches the panic strategy: any hard fault on either core

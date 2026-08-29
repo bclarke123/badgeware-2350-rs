@@ -15,7 +15,9 @@ gently bumpy meadow, a ten-minute day cycle (dusk → orange sunset → starry
 purple night → pink dawn, Bayer-dithered gradients), twinkling stars that only
 come out after dark, and distant flapping bird silhouettes that cross the sky
 by day. Dense scenes run ~1,700–1,900 triangles at a vsync-locked 60 fps on
-the stock 150 MHz clock.
+the stock 150 MHz clock (re-measure after the sprite/AA renderer: see the
+`frame:` lines on the serial log: `vsync` is idle wait, `dma` the transfer
+time left after geometry, and the `core0:` split is the left half's raster).
 
 **Controls**: A = plant a new random seed, B = replay the current tree's
 growth, C = pause/resume the orbit, UP/DOWN = zoom, HOME-hold ~2 s = reboot to
@@ -24,16 +26,35 @@ seeds are logged over USB serial.
 
 ## 3D renderer (`src/render3d`)
 
-Flat-shaded triangles, painter's algorithm, near-plane clipping, colors baked
-at generation time. Every frame runs **two fork-joins across both cores**:
+Painter's algorithm, near-plane clipping, colors baked at generation time.
+Two primitive kinds: flat-shaded triangles with **anti-aliased silhouette
+edges**, and **textured billboard sprites** (every leaf and blossom) sampled
+by the RP2350's SIO interpolators. Every frame runs **two fork-joins across
+both cores**, with the panel DMA hidden behind the first:
 
-1. **Geometry**: core 1 emits the odd half of the tree into its own triangle
-   list and depth-sorts it, while core 0 does the even half plus scenery
-   (terrain, stars, birds) into a second list.
-2. **Raster**: each core clears and draws one half of the framebuffer,
-   merge-walking the two sorted lists (one compare per triangle — no copy, no
-   re-sort). The column-major framebuffer makes the halves contiguous disjoint
-   slices, split at x=160.
+1. **Present + geometry**: core 0 waits for vblank (TE) and starts the ~7 ms
+   DMA of the *previous* frame (22 Mbyte/s parallel bus). While it streams,
+   core 1 emits the odd half of the tree into its own primitive list and
+   core 0 does the even half plus scenery (terrain, stars, birds) into a
+   second list; each list is radix-sorted by depth (packed `depth<<16|index`
+   keys — sorting 4-byte keys, not 32-byte entries, is what keeps the sort
+   out of the budget). Geometry never touches the framebuffer, so it costs
+   nothing on the critical path.
+2. **Raster**: each core clears and draws one part of the framebuffer,
+   merge-walking the two sorted lists (one compare per primitive — no copy,
+   no re-sort). The column-major framebuffer makes the parts contiguous
+   disjoint slices. The DMA streams columns left to right, so core 1 takes
+   the *left* part and starts the moment the DMA's `READ_ADDR` has passed it
+   (~4 ms before the transfer ends), while core 0 takes the right part after
+   the transfer completes. The split column is re-balanced every frame from
+   the two cores' finish times (screen columns are not work: the tree is
+   centred, and its footprint moves with the orbit), and each core skips
+   primitives whose x extent misses its part before any setup.
+
+The DMA is ~8 ms of the 16.7 ms frame (150 KB at 37.5 MHz / 2 cycles per
+byte), so this staggering is what keeps a dense bush at 60 fps. The
+rasterizer is linked into RAM: both cores execute it concurrently and the
+XIP flash cache is shared.
 
 Core 1 runs a bare loop (no executor, no clock access) fed jobs through an
 `embassy-sync` Signal handshake; a HardFault handler and a join watchdog turn
@@ -43,6 +64,30 @@ increments) so the hot loop is a sequential byte fill. Trig and square roots
 are fast f32 approximations — `libm`'s f64-internal `sinf` costs microseconds
 per call on the M33's single-precision FPU (measured as a 20x geometry
 slowdown before replacement).
+
+**Edge anti-aliasing** costs almost nothing because the coverage is already
+there: the fractional bits of each column run's 16.16 end positions are the
+exact vertical coverage of its first and last pixel, so those two pixels are
+alpha-blended (5-bit alpha, one-multiply RGB565 lerp) over whatever the
+painter's order already put there. Only silhouette edges blend — each
+triangle carries a 3-bit mask, and an edge shared with a neighbour (a
+ribbon's diagonal, every terrain grid line) uses the exact pixel-center
+ownership rule instead, so seams stay seamless rather than leaking a
+hairline of sky. Coverage is resolved along y only: shallow edges (the ones
+that shimmer under wind sway) go smooth, steep edges keep their stairs.
+
+**Sprites and the SIO interpolator.** Leaves, tufts and blossoms are one
+screen-aligned textured quad each (2 triangles; blossoms used to be 4 flat
+ones). Textures are *shade maps*, not images — 0 transparent, 1 half-covered
+edge, 2–4 dark/mid/light — baked at boot by supersampling analytic shapes
+into 16×16 maps plus 8×8 mips (`src/render3d/texture.rs`); the rasterizer
+turns levels into RGB565 from each triangle's own base tint, so one map
+serves every green and every pink. Affine u/v stepping per pixel is
+"add, shift, mask, combine into an address", which is exactly what the
+per-core `INTERP0` does in hardware: lane 0 accumulates u, lane 1 v, and one
+`POP_FULL` read returns the texel address while auto-advancing both. The
+lane masks also wrap out-of-range coordinates into the map's transparent
+border, so quad-edge rounding slop can never show a stray texel.
 
 ## Hardware covered
 

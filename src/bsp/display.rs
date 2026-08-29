@@ -247,6 +247,16 @@ impl Display {
     /// ahead of, so the beam never catches the write. The stream itself is
     /// entirely DMA-driven; the CPU is free while awaiting.
     pub async fn present(&mut self, frame: &[u8]) {
+        self.present_begin().await;
+        self.present_dma(frame).await;
+        self.present_end().await;
+    }
+
+    /// First third of a presentation: waits for vblank (TE) and opens the RAM
+    /// write. Split from [`Display::present_dma`] / [`Display::present_end`]
+    /// so the caller can do CPU work that does not touch the framebuffer
+    /// (the next frame's geometry) while the ~7 ms DMA streams the panel.
+    pub async fn present_begin(&mut self) {
         // Robustness on unexpected panels/states: if TE never pulses (e.g. TE
         // wiring assumption wrong), present unsynchronized rather than hanging.
         let te_wait = embassy_time::with_timeout(
@@ -260,7 +270,46 @@ impl Display {
         self.command(RAMWR, &[]).await;
         self.dc.set_high();
         self.cs.set_low();
-        self.sm.tx().dma_push(&mut self.dma, frame, false).await;
+    }
+
+    /// Second third: the frame's DMA transfer. Await the returned future
+    /// (it borrows `frame` until then) before [`Display::present_end`].
+    pub fn present_dma<'a>(&'a mut self, frame: &'a [u8]) -> dma::Transfer<'a> {
+        self.sm.tx().dma_push(&mut self.dma, frame, false)
+    }
+
+    /// [`Display::present_dma`] from a raw pointer, so the caller keeps no
+    /// borrow of the framebuffer during the transfer and may start writing
+    /// the next frame into the part the DMA has already read.
+    ///
+    /// # Safety
+    /// `frame` must point at [`crate::gfx::FB_BYTES`] readable bytes that
+    /// stay valid until the returned transfer completes or is dropped. Bytes
+    /// at or above the address reported by [`Display::dma_read_addr_reg`]
+    /// must not be written until then; bytes below it may be.
+    pub unsafe fn present_dma_raw(&mut self, frame: *const [u8]) -> dma::Transfer<'_> {
+        // Same configuration `dma_push` makes: byte transfers into PIO1 SM0's
+        // TX FIFO, paced by its DREQ.
+        // SAFETY: the caller's contract above.
+        unsafe {
+            self.dma.write(
+                frame,
+                embassy_rp::pac::PIO1.txf(0).as_ptr() as *mut u8,
+                embassy_rp::pac::dma::vals::TreqSel::PIO1_TX0,
+                false,
+            )
+        }
+    }
+
+    /// The DMA channel's `READ_ADDR` register: during a transfer it holds
+    /// the address of the next byte to fetch, so everything below it has
+    /// been consumed. Readable from either core without the driver.
+    pub fn dma_read_addr_reg(&self) -> *const u32 {
+        self.dma.regs().read_addr().as_ptr().cast_const()
+    }
+
+    /// Last third: lets the final bytes clock out and deselects the panel.
+    pub async fn present_end(&mut self) {
         self.drain().await;
         self.cs.set_high();
     }
@@ -305,4 +354,4 @@ impl Display {
     }
 }
 
-// Rust guideline compliant 2026-08-21
+// Rust guideline compliant 2026-08-29

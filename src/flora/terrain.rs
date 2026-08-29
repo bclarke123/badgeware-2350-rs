@@ -84,8 +84,11 @@ impl Terrain {
                 let c = pv[i + 1][j + 1];
                 let d = pv[i + 1][j];
                 let (s0, s1) = self.shades[i][j];
-                out.push(MeshTri { v: [a, b, c], color: tint(s0, dim) });
-                out.push(MeshTri { v: [a, c, d], color: tint(s1, dim) });
+                // Every edge is shared with a neighbouring cell (the patch
+                // rim stays off-screen), so none is anti-aliased: that keeps
+                // the grid seamless instead of drawing a faint lattice.
+                out.push_aa(MeshTri { v: [a, b, c], color: tint(s0, dim) }, 0);
+                out.push_aa(MeshTri { v: [a, c, d], color: tint(s1, dim) }, 0);
             }
         }
 

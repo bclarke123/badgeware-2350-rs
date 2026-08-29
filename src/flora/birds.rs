@@ -92,8 +92,9 @@ impl Flock {
             let tip_r = p.add(v3(w, tip_dy, 0.0));
 
             // Winding toward the camera (see the billboard convention).
-            out.push(MeshTri { v: [b_top, b_bot, tip_l], color: SILHOUETTE });
-            out.push(MeshTri { v: [b_top, tip_r, b_bot], color: SILHOUETTE });
+            // The two wings share the body edge b_top-b_bot.
+            out.push_aa(MeshTri { v: [b_top, b_bot, tip_l], color: SILHOUETTE }, 0b110);
+            out.push_aa(MeshTri { v: [b_top, tip_r, b_bot], color: SILHOUETTE }, 0b011);
         }
     }
 }

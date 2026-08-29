@@ -34,12 +34,17 @@ impl FrameBuffer {
         self.buf
     }
 
-    /// Splits the frame into its left and right screen halves.
+    /// Splits the frame into the columns left of `x` and the rest.
     ///
-    /// Column-major storage makes each half one contiguous slice, which is
-    /// what lets the two cores rasterize disjoint halves with no aliasing.
-    pub fn split_halves(&mut self) -> (&mut [u8], &mut [u8]) {
-        self.buf.split_at_mut(WIDTH / 2 * HEIGHT * 2)
+    /// Column-major storage makes each part one contiguous slice, which is
+    /// what lets the two cores rasterize disjoint parts with no aliasing.
+    pub fn split_at_column(&mut self, x: usize) -> (&mut [u8], &mut [u8]) {
+        self.buf.split_at_mut(x * HEIGHT * 2)
+    }
+
+    /// Start of the pixel storage (for the presentation DMA).
+    pub fn as_ptr(&self) -> *const u8 {
+        self.buf.as_ptr()
     }
 
     #[inline]
@@ -124,4 +129,4 @@ impl NonZeroExt for Rectangle {
     }
 }
 
-// Rust guideline compliant 2026-08-21
+// Rust guideline compliant 2026-08-29

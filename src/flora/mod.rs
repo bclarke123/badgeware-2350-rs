@@ -27,9 +27,11 @@ use embedded_graphics::pixelcolor::Rgb565;
 
 use crate::bsp::buttons::{Button, ButtonEvent, EVENTS};
 use crate::bsp::display::{Display, WIDTH};
+use crate::gfx::FB_BYTES;
 use crate::bsp::leds::{cue, LedCue};
 use crate::gfx::FrameBuffer;
 use crate::render3d::math::{fast_sin, v3, Camera};
+use crate::render3d::texture::Textures;
 use crate::render3d::{core1, ListBuilder, MeshTri, TriList};
 use anim::{ease_in_cubic, lerp_color, Timeline};
 use birds::Flock;
@@ -45,6 +47,7 @@ pub async fn run(
     tri_list_b: &'static mut TriList,
     the_tree: &'static mut Tree,
     the_terrain: &'static mut Terrain,
+    textures: &'static Textures,
 ) -> ! {
     let mut seed = embassy_rp::clocks::RoscRng.next_u32() & 0xff;
     log::info!("growing tree from seed {}", seed);
@@ -89,8 +92,17 @@ pub async fn run(
     // A pending replant: the seed to plant once the despawn shrink finishes.
     let mut despawn: Option<(Timeline, u32)> = None;
 
+    // Raster split column: core 1 draws `0..split_x`, core 0 the rest.
+    // Re-balanced every frame from the two cores' finish times (core 1
+    // starts earlier but the tree's screen footprint moves with the orbit,
+    // so no constant is right for long); see [`core1::RasterJob`].
+    let mut split_x: usize = 176;
     const LOG_FRAMES: u32 = 120;
-    let (mut sum_geom, mut sum_raster) = (0u64, 0u64);
+    let mut sum_geom = 0u64;
+    let (mut sum_flat, mut sum_sprite, mut sum_clear) = (0u64, 0u64, 0u64);
+    let (mut sum_wait, mut sum_dma, mut sum_join) = (0u64, 0u64, 0u64);
+    let (mut sum_draw0, mut sum_c1wait, mut sum_c1draw) = (0u64, 0u64, 0u64);
+    let mut clear_cache = crate::render3d::raster::ClearCache::new();
     let mut frames = 0u32;
 
     loop {
@@ -141,7 +153,23 @@ pub async fn run(
             }
         }
 
+        // ---- Present the previous frame: wait for vblank, then stream it to
+        // the panel by DMA (~7 ms) while this frame's geometry runs on both
+        // cores — geometry never touches the framebuffer, so it hides
+        // entirely behind the transfer. ----
+        let t0 = Instant::now();
+        display.present_begin().await;
+        let t_wait = t0.elapsed().as_micros();
+        let fb_ptr = frame.as_ptr();
+        let dma_read_addr = display.dma_read_addr_reg();
+        // SAFETY: the framebuffer is a 'static allocation; core 1 only writes
+        // columns the DMA has passed (it polls `READ_ADDR`), and core 0 only
+        // writes after awaiting the transfer.
+        let transfer = unsafe { display.present_dma_raw(core::ptr::slice_from_raw_parts(fb_ptr, FB_BYTES)) };
+
         // ---- Animate: slow auto-orbit (pausable) + wind clock ----
+        // Sampled after the vsync wait so animation tracks the frame that
+        // will actually show, not the wait's start.
         let now = Instant::now();
         let dt = (now - last_frame).as_micros() as f32 / 1_000_000.0;
         last_frame = now;
@@ -157,7 +185,7 @@ pub async fn run(
 
         // ---- Geometry (both cores: core 1 takes the odd half of the tree,
         // core 0 the even half plus all scenery, each into its own list) ----
-        let t0 = Instant::now();
+        let t1 = Instant::now();
         let view = camera.view();
         let growth_elapsed = growth.elapsed();
         core1::dispatch(core1::Job::Geom(core1::GeomJob {
@@ -175,47 +203,99 @@ pub async fn run(
         the_tree.emit(&view, growth_elapsed, time_s, tree_scale, 0, &mut builder);
         builder.finish();
         join_or_panic("geom").await;
-        let t_geom = t0.elapsed().as_micros();
+        let t_geom = t1.elapsed().as_micros();
+        fn t2_dma_elapsed(since: Instant, minus_us: u64) -> u64 {
+            since.elapsed().as_micros().saturating_sub(minus_us)
+        }
 
-        // ---- Rasterize (fork-join again over the two sorted lists) ----
-        let t1 = Instant::now();
+        // ---- Rasterize: core 1 starts on the left part as soon as the DMA
+        // has streamed it; core 0 takes the right part after the transfer. ----
+        let t3 = Instant::now();
         let top = RawU16::from(sky_top).into_inner();
         let bottom = RawU16::from(sky_bottom).into_inner();
-        let (left, right) = frame.split_halves();
+        let (left, right) = frame.split_at_column(split_x);
         core1::dispatch(core1::Job::Raster(core1::RasterJob {
             tris_a: core::ptr::from_ref(tri_list),
             tris_b: core::ptr::from_ref(tri_list_b),
-            fb_half: right.as_mut_ptr(),
+            fb_part: left.as_mut_ptr(),
+            x0: 0,
+            x1: split_x as i32,
+            dma_read_addr,
+            wait_until: fb_ptr as u32 + left.len() as u32,
             clear_top: top,
             clear_bottom: bottom,
+            textures: core::ptr::from_ref(textures),
         }));
-        crate::render3d::raster::draw_lists(
+        transfer.await;
+        display.present_end().await;
+        let t_dma = t2_dma_elapsed(t1, t_geom);
+        let t_draw0 = Instant::now();
+        let stats = crate::render3d::raster::draw_lists(
             tri_list,
             tri_list_b,
-            left,
-            0,
-            (WIDTH / 2) as i32,
+            right,
+            split_x as i32,
+            WIDTH as i32,
             top,
             bottom,
+            textures,
+            &mut clear_cache,
         );
+        let t_draw0 = t_draw0.elapsed().as_micros();
+        let t_join = Instant::now();
         join_or_panic("raster").await;
-        let t_raster = t1.elapsed().as_micros();
+        let t_join = t_join.elapsed().as_micros();
+        let _ = t3;
+        let t_c1wait = u64::from(core1::RASTER_WAIT_US.load(portable_atomic::Ordering::Relaxed));
+        let t_c1draw = u64::from(core1::RASTER_DRAW_US.load(portable_atomic::Ordering::Relaxed));
 
-        // ---- Present (vsync'd) ----
-        display.present(frame.bytes()).await;
+        // ---- Balance the split: nudge it toward whichever core finished
+        // first (both finish times are relative to the raster dispatch). ----
+        let finish1 = (t_c1wait + t_c1draw) as i64;
+        let finish0 = (t_dma + t_draw0) as i64;
+        if finish1 - finish0 > 250 {
+            split_x = (split_x - 2).max(96);
+        } else if finish0 - finish1 > 250 {
+            split_x = (split_x + 2).min(256);
+        }
 
         // ---- Stats ----
         sum_geom += t_geom;
-        sum_raster += t_raster;
+        sum_draw0 += t_draw0;
+        sum_c1wait += t_c1wait;
+        sum_c1draw += t_c1draw;
+        sum_flat += u64::from(stats.flat_us);
+        sum_sprite += u64::from(stats.sprite_us);
+        sum_clear += u64::from(stats.clear_us);
+        sum_wait += t_wait;
+        sum_dma += t_dma;
+        sum_join += t_join;
         frames += 1;
         if frames == LOG_FRAMES {
+            // vsync = idle wait for TE; dma = DMA time left after geometry;
+            // c0 = core 0's draw of the right part; c1 = core 1's wait for
+            // the DMA to pass the left part, then its draw; join = how long
+            // core 0 waited for core 1 (0 => core 0 is the bottleneck: move
+            // split_x right; large => move it left). The flat/sprite/clear
+            // split is core 0's part only.
             log::info!(
-                "frame: geom {}us raster {}us ({} tris)",
+                "frame: vsync {} geom {} dma {} c0 {} c1 {}+{} join {} split {} (c0: clear {} flat {} sprite {}) ({} prims)",
+                sum_wait / u64::from(frames),
                 sum_geom / u64::from(frames),
-                sum_raster / u64::from(frames),
+                sum_dma / u64::from(frames),
+                sum_draw0 / u64::from(frames),
+                sum_c1wait / u64::from(frames),
+                sum_c1draw / u64::from(frames),
+                sum_join / u64::from(frames),
+                split_x,
+                sum_clear / u64::from(frames),
+                sum_flat / u64::from(frames),
+                sum_sprite / u64::from(frames),
                 tri_list.len + tri_list_b.len,
             );
-            (sum_geom, sum_raster, frames) = (0, 0, 0);
+            (sum_geom, sum_flat, sum_sprite, sum_clear, sum_wait, sum_dma, sum_join, frames) =
+                (0, 0, 0, 0, 0, 0, 0, 0);
+            (sum_draw0, sum_c1wait, sum_c1draw) = (0, 0, 0);
         }
     }
 }

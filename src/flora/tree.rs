@@ -22,7 +22,8 @@ use crate::render3d::math::{fast_cos, fast_sin};
 
 use super::anim::{ease_out_cubic, segment_progress};
 use crate::render3d::math::{v3, Mat34, Vec3};
-use crate::render3d::{tint, ListBuilder, MeshTri};
+use crate::render3d::texture::{self, Textures};
+use crate::render3d::{tint, ListBuilder, FOCAL};
 
 /// Deepest branch generation (trunk is depth 0; leaves attach at this depth).
 const MAX_DEPTH: u8 = 5;
@@ -52,9 +53,9 @@ pub const TOTAL_GROW_MS: u64 =
 /// Per-seed shape parameters rolled once in [`Tree::generate`].
 ///
 /// Three kinds share one parameter set: sakura (pink blossoms), the classic
-/// green tree, and the bush — a shorter, wider, denser green (blossoms cost 4
-/// triangles to a leaf's 2, so green kinds can afford extra foliage; the
-/// branch/leaf capacity caps bound the worst case regardless).
+/// green tree, and the bush — a shorter, wider, denser green. Every leaf or
+/// blossom is one textured quad (2 triangles); the branch/leaf capacity caps
+/// bound the worst case regardless.
 struct Species {
     blossoms: bool,
     /// Branch-pitch multiplier: <1.0 tall and narrow, >1.0 wide and squat.
@@ -85,8 +86,8 @@ struct Leaf {
     phase: f32,
     /// Base orientation of the billboard shape (radians).
     angle: f32,
-    /// Blossom flower (two layered diamonds) vs foliage leaf (two-tone kite).
-    blossom: bool,
+    /// Texture shape id ([`texture::LEAF`], [`texture::BLOSSOM`], ...).
+    shape: u8,
 }
 
 /// A generated tree, ready to emit each frame. Lives in a static (it is a few
@@ -118,16 +119,19 @@ impl Tree {
                 blossoms: true,
                 spread: rng.range(0.75, 1.4),
                 extra_child_p: 0.35,
-                leaves_per_twig: 3,
+                // Sprites halved the blossom's triangle cost (4 -> 2), so
+                // sakura can carry a denser bloom for the same budget.
+                leaves_per_twig: 4,
                 trunk_scale: 1.0,
             }
         } else if roll < 0.7 {
-            // Classic green tree.
+            // Classic green tree. Half its foliage is three-leaf tufts, so
+            // fewer sprites read as a fuller crown than the old 3 per twig.
             Species {
                 blossoms: false,
                 spread: rng.range(0.75, 1.4),
                 extra_child_p: 0.35,
-                leaves_per_twig: 3,
+                leaves_per_twig: 2,
                 trunk_scale: 1.0,
             }
         } else {
@@ -138,7 +142,9 @@ impl Tree {
                 // 0.65 measured ~1,950 tris = 16.5 ms — the exact frame
                 // budget; 0.55 sheds ~150 tris for reliable 60 fps headroom.
                 extra_child_p: 0.55,
-                leaves_per_twig: 4,
+                // Tuft sprites carry three leaves each: 3 per twig here is
+                // denser on screen than the old 4 flat kites.
+                leaves_per_twig: 3,
                 trunk_scale: 0.72,
             }
         };
@@ -188,20 +194,29 @@ impl Tree {
                 );
                 let blossom = species.blossoms && rng.unit() < 0.65;
                 // The 0.75 tint bakes the retired per-triangle sun lighting.
-                let color = if blossom {
+                // Shade maps add their own dark/light variation on top, so
+                // these are the "mid" tones.
+                let (color, shape) = if blossom {
                     // Blossom pinks.
-                    tint(Rgb565::new(28, 30 + (rng.next() % 12) as u8, 22), 0.75)
+                    (tint(Rgb565::new(30, 34 + (rng.next() % 14) as u8, 24), 0.8), texture::BLOSSOM)
                 } else {
-                    // Leaf greens.
-                    tint(Rgb565::new(4 + (rng.next() % 6) as u8, 34 + (rng.next() % 20) as u8, 6), 0.75)
+                    // Leaf greens; every other green leaf is a three-leaf
+                    // tuft, which reads as a denser crown for no extra cost.
+                    let shape = if rng.unit() < 0.5 { texture::TUFT } else { texture::LEAF };
+                    (
+                        tint(Rgb565::new(4 + (rng.next() % 6) as u8, 34 + (rng.next() % 20) as u8, 6), 0.8),
+                        shape,
+                    )
                 };
+                // Tufts and blossoms are clusters, so they get more room.
+                let size_mul = if shape == texture::LEAF { 1.0 } else { 1.05 };
                 let leaf = Leaf {
                     pos: end.add(jitter),
-                    size: rng.range(0.055, 0.10),
+                    size: rng.range(0.055, 0.10) * size_mul,
                     color,
                     phase: rng.unit(),
                     angle: rng.range(0.0, core::f32::consts::TAU),
-                    blossom,
+                    shape,
                 };
                 if self.leaves.push(leaf).is_err() {
                     return;
@@ -297,12 +312,13 @@ impl Tree {
             let r0 = b.r0 * (0.3 + 0.7 * t) * scale;
             let r1 = b.r1 * (0.3 + 0.7 * t) * scale;
             let color = bark_color(b.depth);
-            push_quad(
-                out,
-                p0.sub(side.scale(r0)),
-                p1.sub(side.scale(r1)),
-                p1.add(side.scale(r1)),
-                p0.add(side.scale(r0)),
+            out.push_quad(
+                [
+                    p0.sub(side.scale(r0)),
+                    p1.sub(side.scale(r1)),
+                    p1.add(side.scale(r1)),
+                    p0.add(side.scale(r0)),
+                ],
                 color,
             );
         }
@@ -327,51 +343,25 @@ impl Tree {
             let s = leaf.size * t * scale;
             // Gentle flutter on top of the leaf's fixed orientation.
             let angle = leaf.angle + 0.18 * fast_sin(time_s * 2.1 + leaf.phase * 6.3);
-            if leaf.blossom {
-                emit_blossom(out, p, s * 0.85, angle, leaf.color);
-            } else {
-                emit_leaf(out, p, s, angle, leaf.color);
-            }
+            emit_sprite(out, p, s, angle, leaf.color, leaf.shape);
         }
     }
 }
 
-/// A foliage leaf: a rotated kite with a dark and a light half, reading as a
-/// curved leaf with a center vein catching the light. 2 triangles.
-fn emit_leaf(out: &mut ListBuilder<'_>, p: Vec3, s: f32, angle: f32, color: Rgb565) {
+/// A leaf or blossom: one screen-aligned textured sprite, rotated by `angle`
+/// about its view-space center `p`; `s` is the half-size of the (unit) map
+/// square, and the quad spans only the map's content rect. The map size is
+/// picked from the projected width so small, distant sprites sample the 8x8
+/// mip instead of shimmering through a 16x16 one.
+fn emit_sprite(out: &mut ListBuilder<'_>, p: Vec3, s: f32, angle: f32, color: Rgb565, shape: u8) {
+    if p.z <= 0.0 {
+        return;
+    }
     let rot = rotator(p, angle);
-    let tip = rot(0.0, 1.05 * s, 0.0);
-    let right = rot(0.55 * s, 0.25 * s, 0.0);
-    let base = rot(0.0, -0.4 * s, 0.0);
-    let left = rot(-0.55 * s, 0.25 * s, 0.0);
-    // Winding chosen camera-facing (see the cube-face convention in flora).
-    out.push(MeshTri { v: [tip, base, left], color: tint(color, 0.72) });
-    out.push(MeshTri { v: [tip, right, base], color: tint(color, 1.12) });
-}
-
-/// A blossom: an outer pink diamond with a smaller, brighter diamond rotated
-/// 45 degrees layered just in front — a five-minute flower. 4 triangles.
-fn emit_blossom(out: &mut ListBuilder<'_>, p: Vec3, s: f32, angle: f32, color: Rgb565) {
-    let outer = rotator(p, angle);
-    let n = outer(0.0, s, 0.0);
-    let e = outer(s, 0.0, 0.0);
-    let s2 = outer(0.0, -s, 0.0);
-    let w = outer(-s, 0.0, 0.0);
-    out.push(MeshTri { v: [n, s2, w], color });
-    out.push(MeshTri { v: [n, e, s2], color });
-
-    // Inner layer: nudged toward the camera so the painter's sort keeps it on
-    // top of its own outer petals.
-    let inner = rotator(p, angle + core::f32::consts::FRAC_PI_4);
-    let i = 0.55 * s;
-    let z = -0.02;
-    let n = inner(0.0, i, z);
-    let e = inner(i, 0.0, z);
-    let s2 = inner(0.0, -i, z);
-    let w = inner(-i, 0.0, z);
-    let bright = tint(color, 1.25);
-    out.push(MeshTri { v: [n, s2, w], color: bright });
-    out.push(MeshTri { v: [n, e, s2], color: bright });
+    let [x_lo, y_lo, x_hi, y_hi] = texture::content_rect(shape);
+    let corners = [rot(x_lo * s, y_hi * s, 0.0), rot(x_hi * s, y_hi * s, 0.0), rot(x_hi * s, y_lo * s, 0.0)];
+    let px = 2.0 * s * FOCAL / p.z;
+    out.push_sprite(corners, Textures::pick(shape, px), color);
 }
 
 /// Billboard-space point placement: rotates local (x, y) by `angle` about the
@@ -402,12 +392,6 @@ fn bark_color(depth: u8) -> Rgb565 {
     // camera-facing surfaces, keeping the established look.
     let d = u8::min(depth, 5);
     tint(Rgb565::new(10 + d * 2, 16 + d * 4, 5 + d), 0.75)
-}
-
-/// Pushes a quad as two triangles (a,b,c) + (a,c,d).
-fn push_quad(out: &mut ListBuilder<'_>, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: Rgb565) {
-    out.push(MeshTri { v: [a, b, c], color });
-    out.push(MeshTri { v: [a, c, d], color });
 }
 
 /// An orthonormal basis perpendicular to `dir`.
@@ -441,4 +425,4 @@ impl XorShift {
     }
 }
 
-// Rust guideline compliant 2026-08-21
+// Rust guideline compliant 2026-08-29
