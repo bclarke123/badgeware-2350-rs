@@ -20,5 +20,6 @@ pub mod rtc;
 pub mod settings;
 pub mod screen;
 pub mod usb;
+pub mod wifi;
 
 // Rust guideline compliant 2026-08-21

@@ -35,6 +35,10 @@ qrcodegen-no-heap = "1.8"
 u8g2-fonts = { version = "0.8", features = ["embedded_graphics_textstyle"] }
 hmac = { version = "0.12", default-features = false }
 sha1 = { version = "0.10", default-features = false }
+cyw43 = "0.7"
+cyw43-pio = "0.10"
+embedded-io-async = "0.7"
+embassy-net = { version = "0.9", features = ["proto-ipv4", "medium-ethernet", "tcp", "udp", "dns", "dhcpv4"] }
 
 [features]
 default = ["tufty"]
@@ -53,6 +57,10 @@ required-features = ["badger"]
 
 [[example]]
 name = "totp"
+required-features = ["badger"]
+
+[[example]]
+name = "weather"
 required-features = ["badger"]
 
 [lints.rust]

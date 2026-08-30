@@ -40,7 +40,7 @@ use tufty_2350::bsp::epd::{Epd, Speed};
 use tufty_2350::bsp::leds::RearLeds;
 use tufty_2350::bsp::rtc::{DateTime, RtcRam};
 use tufty_2350::bsp::screen::{HEIGHT, WIDTH};
-use tufty_2350::bsp::settings::{Settings, MAX_LEN};
+use tufty_2350::bsp::settings::{Settings, MAX_VAL};
 use tufty_2350::gfx::dither::{self, Method};
 use tufty_2350::gfx::grey::Grey;
 
@@ -104,10 +104,10 @@ async fn main(spawner: Spawner) {
     let mut canvas = Grey::new(WIDTH, HEIGHT, CANVAS.take());
 
     // ---- Load or provision the secret + clock.
-    let mut stored = [0u8; MAX_LEN];
+    let mut stored = [0u8; MAX_VAL];
     let mut key = [0u8; 40];
     let mut key_len = settings
-        .read(&mut stored)
+        .get("totp", &mut stored)
         .and_then(|s| base32_decode(s, &mut key))
         .unwrap_or(0);
 
@@ -228,7 +228,7 @@ async fn setup(
         } else if let Some(s) = strip_key(entered, "SECRET") {
             match base32_decode(s.as_bytes(), key) {
                 Some(n) if n >= 10 => {
-                    if settings.write(s.as_bytes()) {
+                    if settings.set("totp", s.as_bytes()) {
                         key_len = n;
                         log::info!("secret stored ({} bytes)", n);
                     } else {
