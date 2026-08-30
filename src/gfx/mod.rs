@@ -6,14 +6,18 @@
 //! the refresh beam — this is what prevents tearing). Drawing is still plain
 //! landscape (x right, y down); only the index math differs, paid once per
 //! pixel write instead of with a whole-frame rotation pass at present time.
-//! 320x240x2 = 150 KiB, held in `.bss`.
+//! 320x240x2 = 150 KiB on the Tufty (264x176x2 = 91 KiB on the Badger),
+//! held in `.bss`.
+
+pub mod dither;
+pub mod grey;
 
 use embedded_graphics::pixelcolor::raw::RawU16;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 
-use crate::bsp::display::{HEIGHT, WIDTH};
+use crate::bsp::screen::{HEIGHT, WIDTH};
 
 /// Size of the framebuffer in bytes.
 pub const FB_BYTES: usize = WIDTH * HEIGHT * 2;
@@ -29,7 +33,7 @@ impl FrameBuffer {
         Self { buf }
     }
 
-    /// The raw bytes to hand to [`crate::bsp::display::Display::present`].
+    /// The raw bytes to hand to the board's display driver.
     pub fn bytes(&self) -> &[u8] {
         self.buf
     }
@@ -43,6 +47,7 @@ impl FrameBuffer {
     }
 
     /// Start of the pixel storage (for the presentation DMA).
+    #[cfg(feature = "tufty")]
     pub fn as_ptr(&self) -> *const u8 {
         self.buf.as_ptr()
     }
@@ -93,7 +98,7 @@ impl DrawTarget for FrameBuffer {
         for x in x0..x0 + area.size.width as usize {
             let col = (x * HEIGHT + y0) * 2;
             let col = &mut self.buf[col..col + area.size.height as usize * 2];
-            for pair in col.chunks_exact_mut(2) {
+            for pair in col.as_chunks_mut::<2>().0 {
                 pair[0] = hi;
                 pair[1] = lo;
             }
@@ -105,7 +110,7 @@ impl DrawTarget for FrameBuffer {
         let raw = RawU16::from(color).into_inner();
         let hi = (raw >> 8) as u8;
         let lo = raw as u8;
-        for pair in self.buf.chunks_exact_mut(2) {
+        for pair in self.buf.as_chunks_mut::<2>().0 {
             pair[0] = hi;
             pair[1] = lo;
         }

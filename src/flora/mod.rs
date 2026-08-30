@@ -26,7 +26,12 @@ use embedded_graphics::pixelcolor::raw::{RawData, RawU16};
 use embedded_graphics::pixelcolor::Rgb565;
 
 use crate::bsp::buttons::{Button, ButtonEvent, EVENTS};
-use crate::bsp::display::{Display, WIDTH};
+#[cfg(feature = "tufty")]
+use crate::bsp::display::Display;
+#[cfg(feature = "badger")]
+use crate::bsp::epd::{Epd, Speed};
+use crate::bsp::screen::{HEIGHT, WIDTH};
+#[cfg(feature = "tufty")]
 use crate::gfx::FB_BYTES;
 use crate::bsp::leds::{cue, LedCue};
 use crate::gfx::FrameBuffer;
@@ -38,10 +43,26 @@ use birds::Flock;
 use terrain::Terrain;
 use tree::Tree;
 
+/// The board's display driver.
+#[cfg(feature = "tufty")]
+pub type Screen = Display;
+/// The board's display driver.
+#[cfg(feature = "badger")]
+pub type Screen = Epd;
+
+/// Slow auto-orbit rate (rad/s): a frame every ~1.2 s on e-paper wants a
+/// gentler turn per frame.
+const ORBIT_RATE: f32 = if cfg!(feature = "badger") { 0.04 } else { 0.15 };
+
+/// Core 1 polls this instead of a DMA register when there is no
+/// presentation DMA to stay behind (e-paper): `wait_until` 0 passes at once.
+#[cfg(feature = "badger")]
+static NO_WAIT: u32 = 0;
+
 /// Runs the plant sim forever; owns the display, framebuffer, and the
 /// statically allocated tree, terrain, and triangle lists.
 pub async fn run(
-    mut display: Display,
+    mut display: Screen,
     mut frame: FrameBuffer,
     tri_list: &'static mut TriList,
     tri_list_b: &'static mut TriList,
@@ -69,10 +90,10 @@ pub async fn run(
             h ^= h << 13;
             h ^= h >> 17;
             h ^= h << 5;
-            let sx = (h % 320) as i32;
+            let sx = (h % WIDTH as u32) as i32;
             // Spread down toward the horizon (~y 175 at default pitch/zoom);
             // the tree and ground occlude any that land behind them.
-            let sy = ((h >> 9) % 175) as i32;
+            let sy = ((h >> 9) % (HEIGHT as u32 * 175 / 240)) as i32;
             let phase = ((h >> 17) % 256) as f32 / 40.0;
             *star = (sx, sy, phase);
         }
@@ -83,7 +104,7 @@ pub async fn run(
     let mut last_frame = Instant::now();
     let mut flock = Flock::new();
     // Desk-art mode: replant on a timer, postponed by any manual (re)growth.
-    const REGROW_EVERY: Duration = Duration::from_secs(60);
+    const REGROW_EVERY: Duration = Duration::from_secs(if cfg!(feature = "badger") { 300 } else { 60 });
     /// The old tree eases (in-cubic) into the ground over the first half of
     /// this window; the second half is a beat of empty ground before the new
     /// tree starts to grow.
@@ -96,13 +117,16 @@ pub async fn run(
     // Re-balanced every frame from the two cores' finish times (core 1
     // starts earlier but the tree's screen footprint moves with the orbit,
     // so no constant is right for long); see [`core1::RasterJob`].
-    let mut split_x: usize = 176;
-    const LOG_FRAMES: u32 = 120;
+    let mut split_x: usize = WIDTH / 2 + 16;
+    // Log every 2 s on the LCD; every few refreshes on e-paper.
+    const LOG_FRAMES: u32 = if cfg!(feature = "badger") { 4 } else { 120 };
     let mut sum_geom = 0u64;
     let (mut sum_flat, mut sum_sprite, mut sum_clear, mut sum_ground) = (0u64, 0u64, 0u64, 0u64);
     let (mut sum_wait, mut sum_dma, mut sum_join) = (0u64, 0u64, 0u64);
     let (mut sum_draw0, mut sum_c1wait, mut sum_c1draw) = (0u64, 0u64, 0u64);
     let mut clear_cache = crate::render3d::raster::ClearCache::new();
+    #[cfg(feature = "badger")]
+    let (mut frames_since_full, mut bloom_shown) = (0u32, false);
     let mut frames = 0u32;
 
     loop {
@@ -157,15 +181,24 @@ pub async fn run(
         // the panel by DMA (~7 ms) while this frame's geometry runs on both
         // cores — geometry never touches the framebuffer, so it hides
         // entirely behind the transfer. ----
-        let t0 = Instant::now();
-        display.present_begin().await;
-        let t_wait = t0.elapsed().as_micros();
-        let fb_ptr = frame.as_ptr();
-        let dma_read_addr = display.dma_read_addr_reg();
-        // SAFETY: the framebuffer is a 'static allocation; core 1 only writes
-        // columns the DMA has passed (it polls `READ_ADDR`), and core 0 only
-        // writes after awaiting the transfer.
-        let transfer = unsafe { display.present_dma_raw(core::ptr::slice_from_raw_parts(fb_ptr, FB_BYTES)) };
+        #[cfg(feature = "tufty")]
+        let (t_wait, fb_ptr, dma_read_addr, transfer) = {
+            let t0 = Instant::now();
+            display.present_begin().await;
+            let t_wait = t0.elapsed().as_micros();
+            let fb_ptr = frame.as_ptr();
+            let dma_read_addr = display.dma_read_addr_reg();
+            // SAFETY: the framebuffer is a 'static allocation; core 1 only
+            // writes columns the DMA has passed (it polls `READ_ADDR`), and
+            // core 0 only writes after awaiting the transfer.
+            let transfer =
+                unsafe { display.present_dma_raw(core::ptr::slice_from_raw_parts(fb_ptr, FB_BYTES)) };
+            (t_wait, fb_ptr, dma_read_addr, transfer)
+        };
+        // E-paper: the previous frame was presented (blocking) at the end of
+        // the last iteration; nothing to overlap.
+        #[cfg(feature = "badger")]
+        let (t_wait, dma_read_addr) = (0u64, core::ptr::from_ref(&NO_WAIT));
 
         // ---- Animate: slow auto-orbit (pausable) + wind clock ----
         // Sampled after the vsync wait so animation tracks the frame that
@@ -174,7 +207,7 @@ pub async fn run(
         let dt = (now - last_frame).as_micros() as f32 / 1_000_000.0;
         last_frame = now;
         if orbiting {
-            camera.yaw += 0.15 * dt;
+            camera.yaw += ORBIT_RATE * dt;
         }
         let time_s = boot.elapsed().as_micros() as f32 / 1_000_000.0;
 
@@ -221,13 +254,19 @@ pub async fn run(
             x0: 0,
             x1: split_x as i32,
             dma_read_addr,
+            #[cfg(feature = "tufty")]
             wait_until: fb_ptr as u32 + left.len() as u32,
+            #[cfg(feature = "badger")]
+            wait_until: 0,
             clear_top: top,
             clear_bottom: bottom,
             textures: core::ptr::from_ref(textures),
         }));
-        transfer.await;
-        display.present_end().await;
+        #[cfg(feature = "tufty")]
+        {
+            transfer.await;
+            display.present_end().await
+        };
         let t_dma = t2_dma_elapsed(t1, t_geom);
         let t_draw0 = Instant::now();
         let stats = crate::render3d::raster::draw_lists(
@@ -246,6 +285,23 @@ pub async fn run(
         join_or_panic("raster").await;
         let t_join = t_join.elapsed().as_micros();
         let _ = t3;
+
+        // ---- E-paper: quantize and refresh (1.1–3.7 s, async). A slow,
+        // clean waveform when the tree has just bloomed and every so often;
+        // the fast one for every growth step in between. ----
+        #[cfg(feature = "badger")]
+        {
+            let bloomed = growth.finished() && !bloom_shown;
+            let full = bloomed || frames_since_full >= 60;
+            display.set_speed(if full { Speed::Slow } else { Speed::Turbo });
+            display.present(frame.bytes()).await;
+            if full {
+                frames_since_full = 0;
+            } else {
+                frames_since_full += 1;
+            }
+            bloom_shown = growth.finished()
+        };
         let t_c1wait = u64::from(core1::RASTER_WAIT_US.load(portable_atomic::Ordering::Relaxed));
         let t_c1draw = u64::from(core1::RASTER_DRAW_US.load(portable_atomic::Ordering::Relaxed));
 
@@ -254,9 +310,9 @@ pub async fn run(
         let finish1 = (t_c1wait + t_c1draw) as i64;
         let finish0 = (t_dma + t_draw0) as i64;
         if finish1 - finish0 > 250 {
-            split_x = (split_x - 2).max(96);
+            split_x = (split_x - 2).max(WIDTH * 3 / 10);
         } else if finish0 - finish1 > 250 {
-            split_x = (split_x + 2).min(256);
+            split_x = (split_x + 2).min(WIDTH * 8 / 10);
         }
 
         // ---- Stats ----
@@ -315,7 +371,7 @@ async fn join_or_panic(stage: &str) {
 }
 
 /// One full sky day, in seconds (10 minutes).
-const DAY_CYCLE_S: f32 = 600.0;
+const DAY_CYCLE_S: f32 = if cfg!(feature = "badger") { 1800.0 } else { 600.0 };
 
 /// Number of stars in the night sky.
 const STAR_COUNT: usize = 20;
@@ -361,14 +417,14 @@ fn push_stars(
     }
     // Far plane: depth key 30 * 2048 stays inside u16 and behind everything.
     const Z: f32 = 30.0;
-    const FOCAL: f32 = 228.0;
+    const FOCAL: f32 = crate::render3d::FOCAL;
     let size = 1.6 * Z / FOCAL; // ~1.6 px on screen
     let white = Rgb565::new(26, 56, 31);
     for &(sx, sy, twinkle_phase) in stars {
         let twinkle = 0.55 + 0.45 * fast_sin(time_s * 1.9 + twinkle_phase);
         let color = lerp_color(sky_top, white, night * twinkle);
-        let x = (sx as f32 - 160.0) * Z / FOCAL;
-        let y = (120.0 - sy as f32) * Z / FOCAL;
+        let x = (sx as f32 - WIDTH as f32 * 0.5) * Z / FOCAL;
+        let y = (HEIGHT as f32 * 0.5 - sy as f32) * Z / FOCAL;
         let p = v3(x, y, Z);
         out.push(MeshTri {
             v: [

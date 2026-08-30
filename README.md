@@ -100,6 +100,25 @@ per-core `INTERP0` does in hardware: lane 0 accumulates u, lane 1 v, and one
 lane masks also wrap out-of-range coordinates into the map's transparent
 border, so quad-edge rounding slop can never show a stray texel.
 
+## Badger 2350 (e-paper)
+
+The same library targets the Badger 2350 (`--no-default-features --features
+badger`): RP2350A, 2.7" 264×176 SSD1680 four-grey e-paper on SPI0
+(`src/bsp/epd.rs`, Pimoroni's waveform LUT ported verbatim; full refresh
+measured at 1.14 s TURBO to 3.67 s SLOW, four clean greys, no visible
+ghosting). Buttons, LEDs, RTC and the POWMAN sleep path are pin-identical to
+the Tufty.
+
+Greyscale rendering goes through `gfx::grey` (an 8-bit `embedded-graphics`
+canvas, with a 2× supersampling resolve) and `gfx::dither` (linear-light
+quantization against the panel's calibrated reflectances — its level 1 is
+nearly black, ~10%, and level 2 ~51% — with Bayer 4×4/8×8, Floyd–Steinberg
+and nearest, selectable per rectangle). `examples/epd_test.rs` is the test
+card used to judge all of this on the panel: flat levels and ramps, the three
+dithers, 1:1 vs supersampled text, and a shaded sphere; A/B refresh at
+TURBO/SLOW and C/UP/DOWN adjust the calibration live. The tree garden also
+runs on it (`--example tree`), though it was designed for a backlit screen.
+
 ## Hardware covered
 
 | Subsystem | Support |
@@ -120,19 +139,26 @@ border, so quad-edge rounding slop can never show a stray texel.
 Prerequisites: Rust stable with the `thumbv8m.main-none-eabihf` target
 (`rust-toolchain.toml` installs it) and `picotool` (`brew install picotool`).
 
-1. **First flash:** hold the BOOT button while plugging in USB — the badge
-   mounts as `RP2350` bootloader — then:
+The crate is a library plus binaries in `examples/`; the board is a Cargo
+feature (`tufty`, default, or `badger`):
 
-   ```sh
-   cargo run --release
-   ```
+```sh
+cargo run --release --example tree                                        # Tufty 2350
+cargo run --release --example tree --no-default-features --features badger # Badger 2350
+```
+
+1. **First flash:** hold the BOOT button while plugging in USB — the badge
+   mounts as `RP2350` bootloader — then run the command above. (On a Badger
+   still running BadgeOS, `import machine; machine.bootloader()` at its
+   MicroPython REPL does the same; our firmware replaces BadgeOS, which is
+   restored by flashing Pimoroni's release `.uf2`.)
 
 2. **Every flash after that:** hold **HOME for 2 seconds** on the running
-   firmware to reboot into BOOTSEL, then `cargo run --release` again.
+   firmware to reboot into BOOTSEL, then run the command again.
    Panics and hard faults also drop the badge back into BOOTSEL, so it can
    always be reflashed.
 
-Logs: `screen /dev/tty.usbmodem*` (or `tio`); plain-text `log` output over USB CDC.
+Logs: `screen /dev/cu.usbmodem*` (or `tio`); plain-text `log` output over USB CDC.
 
 ## Display driver notes
 

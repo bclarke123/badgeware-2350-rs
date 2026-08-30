@@ -33,7 +33,7 @@ use static_cell::StaticCell;
 use super::raster::ClearCache;
 use super::texture::Textures;
 use super::{raster, ListBuilder, TriList};
-use crate::bsp::display::HEIGHT;
+use crate::bsp::screen::HEIGHT;
 // Layering note: core1 knows about the tree so the geometry fork-join stays a
 // plain function call on this side; acceptable coupling in a single-app binary.
 use crate::flora::tree::Tree;

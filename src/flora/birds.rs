@@ -103,6 +103,12 @@ impl Flock {
 
 /// Uniform-ish 0..1 from the hardware entropy source (wildlife may be truly
 /// random; only trees must be reproducible).
+impl Default for Flock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn rand_unit() -> f32 {
     (RoscRng.next_u32() >> 8) as f32 / 16_777_216.0
 }

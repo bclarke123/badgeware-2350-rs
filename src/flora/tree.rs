@@ -40,11 +40,16 @@ pub const MAX_BRANCHES: usize = 256;
 /// Leaf capacity, pruned the same way.
 pub const MAX_LEAVES: usize = 768;
 
+/// Growth runs this many times slower on e-paper: a frame every ~1.2 s
+/// turns the 8.5 s LCD growth into a ~90 s time-lapse, one visible step
+/// per refresh.
+const TIME_SCALE: u64 = if cfg!(feature = "badger") { 10 } else { 1 };
+
 /// Per-depth growth stagger and per-branch growth duration.
-const GROW_STAGGER_MS: u64 = 850;
-const GROW_LEN_MS: u64 = 1300;
+const GROW_STAGGER_MS: u64 = 850 * TIME_SCALE;
+const GROW_LEN_MS: u64 = 1300 * TIME_SCALE;
 /// Leaves start after the last branch depth and pop in over this long.
-const LEAF_LEN_MS: u64 = 700;
+const LEAF_LEN_MS: u64 = 700 * TIME_SCALE;
 
 /// Total time from seed to full bloom (for callers pacing a replay).
 pub const TOTAL_GROW_MS: u64 =
@@ -332,7 +337,7 @@ impl Tree {
             .enumerate()
             .filter(|(i, _)| i & 1 == parity)
         {
-            let delay = leaf_delay_base + (leaf.phase * 900.0) as u64;
+            let delay = leaf_delay_base + (leaf.phase * 900.0) as u64 * TIME_SCALE;
             let t = ease_out_cubic(segment_progress(
                 growth_elapsed,
                 Duration::from_millis(delay),

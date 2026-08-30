@@ -25,7 +25,7 @@ pub mod texture;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 
-use crate::bsp::display::{HEIGHT, WIDTH};
+use crate::bsp::screen::{HEIGHT, WIDTH};
 use math::Vec3;
 
 /// Maximum primitives per frame. 2048 x 32 bytes = 64 KiB; sized for a dense
@@ -156,8 +156,9 @@ impl TriList {
 /// Anything closer than this is clipped (view space looks down +z).
 const NEAR: f32 = 0.1;
 
-/// Focal length in pixels for a ~70 degree horizontal field of view.
-pub const FOCAL: f32 = 228.0;
+/// Focal length in pixels for a ~70 degree horizontal field of view
+/// (228 px at 320 wide), scaled with the board's screen width.
+pub const FOCAL: f32 = WIDTH as f32 * 0.7125;
 
 /// Push-based frame assembler: clips, projects, and depth-keys each pushed
 /// view-space triangle, then depth-sorts on [`ListBuilder::finish`].

@@ -21,6 +21,24 @@ pub const fn v3(x: f32, y: f32, z: f32) -> Vec3 {
     Vec3 { x, y, z }
 }
 
+impl core::ops::Add for Vec3 {
+    type Output = Vec3;
+    fn add(self, o: Vec3) -> Vec3 {
+        v3(self.x + o.x, self.y + o.y, self.z + o.z)
+    }
+}
+
+impl core::ops::Sub for Vec3 {
+    type Output = Vec3;
+    fn sub(self, o: Vec3) -> Vec3 {
+        v3(self.x - o.x, self.y - o.y, self.z - o.z)
+    }
+}
+
+// The inherent `add`/`sub` keep call sites method-chained (`a.add(b.scale(t))`)
+// without importing the ops traits everywhere; the traits above make the
+// operators available too.
+#[expect(clippy::should_implement_trait, reason = "ops traits are implemented as well; inherent forms keep call sites free of trait imports")]
 impl Vec3 {
     pub fn add(self, o: Vec3) -> Vec3 {
         v3(self.x + o.x, self.y + o.y, self.z + o.z)

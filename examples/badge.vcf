@@ -1,0 +1,8 @@
+BEGIN:VCARD
+VERSION:3.0
+N:Doe;John;;;
+FN:John Doe
+EMAIL:jdoe@example.com
+URL:https://github.com/johndoe
+X-SOCIALPROFILE;TYPE=linkedin:https://www.linkedin.com/in/john-doe/
+END:VCARD

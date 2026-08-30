@@ -1,7 +1,11 @@
-//! Tufty 2350 badge firmware: Embassy framework plus a Simon-style memory game.
+//! The tree garden: a procedurally grown 3D tree on a dual-core software
+//! renderer. `cargo run --release --example tree` for the Tufty 2350 (LCD);
+//! add `--no-default-features --features badger` for the Badger 2350's
+//! four-grey e-paper (it runs, but was designed for a backlit screen).
 //!
-//! Boot order matters here: `POWER_EN` (GPIO41) is driven high immediately so the
-//! badge stays latched on when running from battery, before anything slow happens.
+//! Boot order matters here: `POWER_EN` (GPIO41 on the Tufty, GPIO27 on the
+//! Badger) is driven high immediately so the badge stays latched on when
+//! running from battery, before anything slow happens.
 //!
 //! No debug probe is required. Flashing goes over USB via `picotool` (see
 //! `.cargo/config.toml`), logs are plain text on the USB serial port, and holding
@@ -10,44 +14,38 @@
 #![no_std]
 #![no_main]
 
-mod bsp;
-mod flora;
-mod gfx;
-mod render3d;
+use tufty_2350::{bsp, flora, gfx, render3d};
 
 use embassy_executor::Spawner;
-use embassy_rp::block::ImageDef;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
-use embassy_rp::peripherals::{PIO1, USB};
-use embassy_rp::{adc, bind_interrupts, dma, pio, usb};
+use embassy_rp::peripherals::USB;
+#[cfg(feature = "tufty")]
+use embassy_rp::peripherals::PIO1;
+#[cfg(feature = "tufty")]
+use embassy_rp::{adc, dma, pio};
+use embassy_rp::{bind_interrupts, usb};
 use static_cell::ConstStaticCell;
 
-use crate::bsp::backlight::Backlight;
-use crate::bsp::buttons::ButtonPins;
-use crate::bsp::display::Display;
-use crate::bsp::leds::RearLeds;
-use crate::gfx::{FrameBuffer, FB_BYTES};
+#[cfg(feature = "tufty")]
+use bsp::backlight::Backlight;
+use bsp::buttons::ButtonPins;
+#[cfg(feature = "tufty")]
+use bsp::display::Display;
+#[cfg(feature = "badger")]
+use bsp::epd::Epd;
+use bsp::leds::RearLeds;
+use gfx::{FrameBuffer, FB_BYTES};
 
-/// Boot ROM image definition; without this block in `.start_block` the RP2350
-/// boot ROM refuses to run the image (the board would appear dead after flashing).
-#[link_section = ".start_block"]
-#[used]
-pub static IMAGE_DEF: ImageDef = ImageDef::secure_exe();
-
-/// Metadata shown by `picotool info`.
-#[link_section = ".bi_entries"]
-#[used]
-pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 3] = [
-    embassy_rp::binary_info::rp_program_name!(c"tufty-2350"),
-    embassy_rp::binary_info::rp_program_description!(c"Dual-core 3D procedural tree garden"),
-    embassy_rp::binary_info::rp_program_build_attribute!(),
-];
-
+#[cfg(feature = "tufty")]
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
     PIO1_IRQ_0 => pio::InterruptHandler<PIO1>;
     DMA_IRQ_0 => dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>;
     ADC_IRQ_FIFO => adc::InterruptHandler;
+});
+#[cfg(feature = "badger")]
+bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => usb::InterruptHandler<USB>;
 });
 
 /// The 150 KiB RGB565 framebuffer lives in `.bss` (const-initialized in place,
@@ -80,7 +78,10 @@ async fn main(spawner: Spawner) {
     // Latch board power before anything else: on battery, the badge browns out
     // if this pin is not asserted shortly after boot. It also powers the light
     // sensor, RTC, and Qwiic connector. Forget the pin so it stays high forever.
+    #[cfg(feature = "tufty")]
     let power_en = Output::new(p.PIN_41, Level::High);
+    #[cfg(feature = "badger")]
+    let power_en = Output::new(p.PIN_27, Level::High);
     core::mem::forget(power_en);
 
     // Stock-firmware sleep emulation: if the RESET button (readable on GPIO14
@@ -120,30 +121,43 @@ async fn main(spawner: Spawner) {
     };
     spawner.spawn(bsp::buttons::button_task(buttons).unwrap());
 
-    // Backlight off until the first frame has been presented.
-    let mut backlight = Backlight::new(p.PWM_SLICE5, p.PIN_26);
-
-    // Display: ST7789 over the 8-bit 8080 parallel bus, PIO1 + DMA.
-    let dma_ch = dma::Channel::new(p.DMA_CH0, Irqs);
-    let mut display = Display::new(
-        p.PIO1, Irqs, dma_ch, p.PIN_21, p.PIN_27, p.PIN_28, p.PIN_30, p.PIN_31, p.PIN_32,
-        p.PIN_33, p.PIN_34, p.PIN_35, p.PIN_36, p.PIN_37, p.PIN_38, p.PIN_39,
-    );
-    display.init().await;
-    log::info!("display initialised");
-
     let frame = FrameBuffer::new(FRAMEBUFFER.take());
 
-    // Light sensor for automatic backlight (GPIO43 / ADC).
-    let adc = adc::Adc::new(p.ADC, Irqs, adc::Config::default());
-    let light = adc::Channel::new_pin(p.PIN_43, Pull::None);
-    spawner.spawn(bsp::backlight::auto_backlight_task(adc, light).unwrap());
+    #[cfg(feature = "tufty")]
+    let display = {
+        // Backlight off until the first frame has been presented.
+        let mut backlight = Backlight::new(p.PWM_SLICE5, p.PIN_26);
 
-    // First frame is black; light the backlight only after it is on screen so
-    // power-on never shows random panel RAM.
-    display.present(frame.bytes()).await;
-    backlight.set_brightness(200);
-    spawner.spawn(bsp::backlight::backlight_task(backlight).unwrap());
+        // Display: ST7789 over the 8-bit 8080 parallel bus, PIO1 + DMA.
+        let dma_ch = dma::Channel::new(p.DMA_CH0, Irqs);
+        let mut display = Display::new(
+            p.PIO1, Irqs, dma_ch, p.PIN_21, p.PIN_27, p.PIN_28, p.PIN_30, p.PIN_31, p.PIN_32,
+            p.PIN_33, p.PIN_34, p.PIN_35, p.PIN_36, p.PIN_37, p.PIN_38, p.PIN_39,
+        );
+        display.init().await;
+        log::info!("display initialised");
+
+        // Light sensor for automatic backlight (GPIO43 / ADC).
+        let adc = adc::Adc::new(p.ADC, Irqs, adc::Config::default());
+        let light = adc::Channel::new_pin(p.PIN_43, Pull::None);
+        spawner.spawn(bsp::backlight::auto_backlight_task(adc, light).unwrap());
+
+        // First frame is black; light the backlight only after it is on
+        // screen so power-on never shows random panel RAM.
+        display.present(frame.bytes()).await;
+        backlight.set_brightness(200);
+        spawner.spawn(bsp::backlight::backlight_task(backlight).unwrap());
+        display
+    };
+
+    #[cfg(feature = "badger")]
+    let display = {
+        // E-paper: SSD1680 on SPI0. No backlight, no light sensor.
+        let mut display = Epd::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_17, p.PIN_20, p.PIN_21, p.PIN_16);
+        display.init().await;
+        log::info!("e-paper initialised");
+        display
+    };
 
     let textures = TEXTURES.take();
     textures.generate();
@@ -161,30 +175,4 @@ async fn main(spawner: Spawner) {
     .await;
 }
 
-/// Fault strategy matches the panic strategy: any hard fault on either core
-/// (both share this vector table) reboots into BOOTSEL so the badge is always
-/// reflashable — a faulted core 1 must not leave core 0 frozen at a join.
-#[cortex_m_rt::exception]
-unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
-    embassy_rp::rom_data::reboot(0x0002, 100, 0, 0);
-    loop {
-        cortex_m::asm::wfe();
-    }
-}
-
-/// Panic strategy for a probe-less board: give a human five seconds to notice
-/// (and a USB host time to read any last log), then reboot into BOOTSEL so the
-/// badge can always be reflashed and never feels bricked.
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    log::error!("panic: {}", info);
-    // ~5 s at the default 150 MHz system clock.
-    cortex_m::asm::delay(750_000_000);
-    // 0x0002 = REBOOT_TYPE_BOOTSEL, 100 ms delay, no PC/SP.
-    embassy_rp::rom_data::reboot(0x0002, 100, 0, 0);
-    loop {
-        cortex_m::asm::wfe();
-    }
-}
-
-// Rust guideline compliant 2026-08-21
+// Rust guideline compliant 2026-08-30

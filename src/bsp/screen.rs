@@ -1,0 +1,24 @@
+//! Screen geometry for the selected board (Cargo feature `tufty` or
+//! `badger`). Everything above the drivers — framebuffer, projection,
+//! rasterizer split — is written against these two constants.
+
+/// Landscape width in pixels.
+#[cfg(feature = "tufty")]
+pub const WIDTH: usize = 320;
+/// Landscape height in pixels.
+#[cfg(feature = "tufty")]
+pub const HEIGHT: usize = 240;
+
+/// Landscape width in pixels.
+#[cfg(feature = "badger")]
+pub const WIDTH: usize = 264;
+/// Landscape height in pixels.
+#[cfg(feature = "badger")]
+pub const HEIGHT: usize = 176;
+
+#[cfg(not(any(feature = "tufty", feature = "badger")))]
+compile_error!("enable exactly one board feature: `tufty` (default) or `badger`");
+#[cfg(all(feature = "tufty", feature = "badger"))]
+compile_error!("features `tufty` and `badger` are mutually exclusive (use --no-default-features)");
+
+// Rust guideline compliant 2026-08-30

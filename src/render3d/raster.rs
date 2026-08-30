@@ -67,7 +67,7 @@ use embassy_rp::pac;
 
 use super::texture::{content_rect, GroundMap, TexMap, Textures, EDGE, GROUND_LEVELS, TRANSPARENT};
 use super::{GroundAttr, ScreenTri, TriList, FOCAL, GROUND_TEX};
-use crate::bsp::display::HEIGHT;
+use crate::bsp::screen::HEIGHT;
 
 /// Framebuffer height in 16.16 fixed point.
 const HEIGHT_FX: i32 = (HEIGHT as i32) << 16;
@@ -96,6 +96,12 @@ fn now_us() -> u32 {
 pub struct ClearCache {
     key: u32,
     columns: [[u32; COL_BYTES / 4]; 4],
+}
+
+impl Default for ClearCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClearCache {

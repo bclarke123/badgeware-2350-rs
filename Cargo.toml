@@ -3,13 +3,12 @@ name = "tufty-2350"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Embassy-based framework and Simon memory game for the Pimoroni Tufty 2350 badge"
+description = "Procedural tree garden and e-paper apps for Pimoroni's RP2350 badges (Tufty 2350, Badger 2350)"
 publish = false
 
 [dependencies]
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
 embassy-rp = { version = "0.10.0", features = [
-    "rp235xb",
     "time-driver",
     "critical-section-impl",
     "binary-info",
@@ -32,6 +31,23 @@ portable-atomic = { version = "1", features = ["critical-section"] }
 static_cell = "2.1"
 heapless = "0.9"
 rand_core = "0.9"
+qrcodegen-no-heap = "1.8"
+u8g2-fonts = { version = "0.8", features = ["embedded_graphics_textstyle"] }
+
+[features]
+default = ["tufty"]
+# Pimoroni Tufty 2350: RP2350B, 320x240 ST7789 LCD on an 8-bit parallel bus.
+tufty = ["embassy-rp/rp235xb"]
+# Pimoroni Badger 2350: RP2350A, 264x176 four-grey SSD1680 e-paper on SPI0.
+badger = ["embassy-rp/rp235xa"]
+
+[[example]]
+name = "epd_test"
+required-features = ["badger"]
+
+[[example]]
+name = "badge"
+required-features = ["badger"]
 
 [lints.rust]
 ambiguous_negative_literals = "warn"

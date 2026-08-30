@@ -38,11 +38,6 @@ use embassy_time::Timer;
 use fixed::types::extra::U8;
 use fixed::FixedU32;
 
-/// Panel width in landscape orientation.
-pub const WIDTH: usize = 320;
-/// Panel height in landscape orientation.
-pub const HEIGHT: usize = 240;
-
 /// Maximum PIO clock for the parallel bus, from Pimoroni's driver (`max_pio_clk`).
 ///
 /// One byte takes two PIO cycles, so this yields ~22 Mbyte/s — faster than the
