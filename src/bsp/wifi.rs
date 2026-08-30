@@ -120,4 +120,41 @@ pub async fn connect(
     Err(last_err)
 }
 
+impl Wifi {
+    /// Disassociates from the network (the stack and tasks stay alive); use
+    /// [`Wifi::rejoin`] to come back. For apps that idle between bursts of
+    /// traffic and want the radio quiet in between.
+    pub async fn leave(&mut self) {
+        self.control.leave().await;
+        log::info!("wifi: left network");
+    }
+
+    /// Rejoins after [`Wifi::leave`] and waits (bounded) for connectivity.
+    pub async fn rejoin(&mut self, ssid: &str, passphrase: &str) -> bool {
+        for attempt in 1..=3 {
+            log::info!("rejoin '{}' (attempt {}/3)", ssid, attempt);
+            match with_timeout(
+                Duration::from_secs(30),
+                self.control.join(ssid, JoinOptions::new(passphrase.as_bytes())),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    if with_timeout(Duration::from_secs(20), self.stack.wait_config_up()).await.is_ok() {
+                        return true;
+                    }
+                    let _ = self.control.leave().await;
+                }
+                Ok(Err(e)) => log::warn!("rejoin failed: {:?}", e),
+                Err(_) => {
+                    log::warn!("rejoin timed out");
+                    let _ = self.control.leave().await;
+                }
+            }
+            Timer::after(Duration::from_secs(2)).await;
+        }
+        false
+    }
+}
+
 // Rust guideline compliant 2026-08-30
