@@ -14,7 +14,8 @@ staggered cubic-eased growth from bare trunk to full bloom. Around it: a
 gently bumpy meadow, a ten-minute day cycle (dusk → orange sunset → starry
 purple night → pink dawn, Bayer-dithered gradients), twinkling stars that only
 come out after dark, and distant flapping bird silhouettes that cross the sky
-by day. Dense scenes run ~1,700–1,900 triangles at a vsync-locked 60 fps on
+by day, over a perspective-textured meadow that fogs into the horizon.
+Dense scenes run ~1,700–1,900 triangles at a vsync-locked 60 fps on
 the stock 150 MHz clock (re-measure after the sprite/AA renderer: see the
 `frame:` lines on the serial log: `vsync` is idle wait, `dma` the transfer
 time left after geometry, and the `core0:` split is the left half's raster).
@@ -75,6 +76,16 @@ ribbon's diagonal, every terrain grid line) uses the exact pixel-center
 ownership rule instead, so seams stay seamless rather than leaking a
 hairline of sky. Coverage is resolved along y only: shallow edges (the ones
 that shimmer under wind sway) go smooth, steep edges keep their stairs.
+
+**Ground.** The meadow's 98 triangles are perspective-correct textured:
+`u/z`, `v/z`, `1/z` are affine in screen space, so each column is walked in
+8-pixel chunks with one reciprocal per chunk and the interpolator stepping
+u/v inside it. Texture coordinates are world x/z, so the grass is nailed to
+the ground as the camera orbits. The tile is a boot-time procedural shade
+map (3-octave tiling value noise quantized to 8 levels plus blade flecks,
+64 texels per unit, box-averaged mips picked per triangle by depth), tinted
+per triangle from the cell mottle and fogged toward the sky's horizon colour
+with distance.
 
 **Sprites and the SIO interpolator.** Leaves, tufts and blossoms are one
 screen-aligned textured quad each (2 triangles; blossoms used to be 4 flat

@@ -47,6 +47,7 @@ impl Vec3 {
     }
 
     /// Unit vector (~0.0001 length error); zero for near-zero input, not NaN.
+    #[link_section = ".data.geom"]
     pub fn normalize(self) -> Vec3 {
         let len_sq = self.dot(self);
         if len_sq < 1e-12 {
@@ -60,6 +61,7 @@ impl Vec3 {
 ///
 /// Runs in a handful of FPU cycles; relative error is under 5e-6 after the
 /// second iteration — far below anything visible in shading or geometry.
+#[link_section = ".data.geom"]
 pub fn inv_sqrt(x: f32) -> f32 {
     let i = 0x5f37_59df - (x.to_bits() >> 1);
     let mut y = f32::from_bits(i);
@@ -71,6 +73,7 @@ pub fn inv_sqrt(x: f32) -> f32 {
 /// Fast sine (max error ~1e-3): range-reduce to one period, then a parabola
 /// with an odd correction term. Accurate enough for animation and lighting;
 /// do not use where phase must stay exact over unbounded time.
+#[link_section = ".data.geom"]
 pub fn fast_sin(x: f32) -> f32 {
     const TAU: f32 = core::f32::consts::TAU;
     // Wrap to [-pi, pi]. The i32 cast bounds usable |x| to ~2^31/tau, far
@@ -86,6 +89,7 @@ pub fn fast_sin(x: f32) -> f32 {
 }
 
 /// Fast cosine via the sine phase shift.
+#[link_section = ".data.geom"]
 pub fn fast_cos(x: f32) -> f32 {
     fast_sin(x + core::f32::consts::FRAC_PI_2)
 }
@@ -143,6 +147,7 @@ impl Mat34 {
         Mat34(r)
     }
 
+    #[link_section = ".data.geom"]
     pub fn transform_point(&self, p: Vec3) -> Vec3 {
         let m = &self.0;
         v3(

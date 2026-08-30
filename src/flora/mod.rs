@@ -347,6 +347,8 @@ fn sky_for(phase: f32) -> (Rgb565, Rgb565, f32) {
 
 /// Emits the starfield as tiny far-plane triangles (fixed on screen, like a
 /// skybox; drawn first by the painter's sort so the tree occludes them).
+#[link_section = ".data.geom"]
+#[inline(never)]
 fn push_stars(
     out: &mut ListBuilder<'_>,
     stars: &[(i32, i32, f32); STAR_COUNT],

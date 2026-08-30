@@ -18,6 +18,7 @@ pub fn ease_in_cubic(t: f32) -> f32 {
 }
 
 /// Decelerating to one: `1 - (1-t)^3`.
+#[link_section = ".data.geom"]
 pub fn ease_out_cubic(t: f32) -> f32 {
     let u = 1.0 - t;
     1.0 - u * u * u
@@ -39,6 +40,7 @@ pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 /// Per-channel RGB565 interpolation between two colors.
+#[link_section = ".data.geom"]
 pub fn lerp_color(a: Rgb565, b: Rgb565, t: f32) -> Rgb565 {
     let ch = |a: u8, b: u8| lerp(f32::from(a), f32::from(b), t) as u8;
     Rgb565::new(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
@@ -95,6 +97,7 @@ impl Timeline {
 ///
 /// Returns 0.0 before the sub-window opens and 1.0 after it closes; used for
 /// staggered per-element animations against one shared elapsed sample.
+#[link_section = ".data.geom"]
 pub fn segment_progress(elapsed: Duration, delay: Duration, length: Duration) -> f32 {
     if elapsed <= delay {
         return 0.0;

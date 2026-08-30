@@ -71,6 +71,8 @@ impl Terrain {
 
     /// Emits the patch; `dim` scales colors (night darkening) and `horizon`
     /// is the sky colour distant ground fogs toward.
+    #[link_section = ".data.geom"]
+    #[inline(never)]
     pub fn emit(&self, view: &Mat34, dim: f32, horizon: Rgb565, out: &mut ListBuilder<'_>) {
         // Transform the vertex grid once (64 points).
         let mut pv = [[Vec3::default(); VERTS]; VERTS];

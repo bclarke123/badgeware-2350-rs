@@ -269,6 +269,8 @@ impl Tree {
     /// the wind sway naturally (its amplitude grows with height).
     /// `parity` selects every other branch/leaf (0 or 1) so the two cores can
     /// each emit half of the tree into their own list.
+    #[link_section = ".data.geom"]
+    #[inline(never)]
     pub fn emit(
         &self,
         view: &Mat34,
@@ -353,6 +355,7 @@ impl Tree {
 /// square, and the quad spans only the map's content rect. The map size is
 /// picked from the projected width so small, distant sprites sample the 8x8
 /// mip instead of shimmering through a 16x16 one.
+#[link_section = ".data.geom"]
 fn emit_sprite(out: &mut ListBuilder<'_>, p: Vec3, s: f32, angle: f32, color: Rgb565, shape: u8) {
     if p.z <= 0.0 {
         return;
@@ -366,6 +369,7 @@ fn emit_sprite(out: &mut ListBuilder<'_>, p: Vec3, s: f32, angle: f32, color: Rg
 
 /// Billboard-space point placement: rotates local (x, y) by `angle` about the
 /// view-space center `p`, with an optional depth nudge.
+#[link_section = ".data.geom"]
 fn rotator(p: Vec3, angle: f32) -> impl Fn(f32, f32, f32) -> Vec3 {
     let (c, s) = (fast_cos(angle), fast_sin(angle));
     move |x: f32, y: f32, z: f32| p.add(v3(x * c - y * s, x * s + y * c, z))
@@ -375,6 +379,7 @@ fn rotator(p: Vec3, angle: f32) -> impl Fn(f32, f32, f32) -> Vec3 {
 /// Wind: a smooth displacement field over height and time. Being a pure
 /// function of position, parent tips and child bases displace identically —
 /// joints cannot separate.
+#[link_section = ".data.geom"]
 pub(super) fn sway(p: Vec3, time_s: f32) -> Vec3 {
     // Amplitude grows with height above the roots so the trunk barely moves.
     let lever = (p.y + 0.95).max(0.0);
@@ -386,6 +391,7 @@ pub(super) fn sway(p: Vec3, time_s: f32) -> Vec3 {
     )
 }
 
+#[link_section = ".data.geom"]
 fn bark_color(depth: u8) -> Rgb565 {
     // Trunk dark brown, lightening toward the twigs. The 0.75 factor bakes
     // the sun intensity the old per-triangle lighting produced for

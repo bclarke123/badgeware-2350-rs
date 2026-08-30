@@ -12,6 +12,11 @@
 //! both cores rasterize ("tiled" split) rather than dedicating core 1 to all
 //! of rendering.
 
+//! Everything on the per-frame geometry path is linked into RAM
+//! (`.data.geom`), like the rasterizer: both cores run it concurrently and
+//! the shared XIP flash cache stalls them on each other's misses (measured
+//! as +1.5 ms of geometry when the binary grew past the cache's comfort).
+
 pub mod core1;
 pub mod math;
 pub mod raster;
@@ -66,6 +71,7 @@ pub struct ScreenTri {
 }
 
 /// Packs a screen x range into [`ScreenTri::xr`].
+#[link_section = ".data.geom"]
 fn x_range(min: f32, max: f32) -> [u8; 2] {
     [(min * 0.5).clamp(0.0, 255.0) as u8, (max * 0.5 + 1.0).clamp(0.0, 255.0) as u8]
 }
@@ -176,6 +182,7 @@ impl<'a> ListBuilder<'a> {
     }
 
     /// Adds one free-standing view-space triangle (all edges anti-aliased).
+    #[link_section = ".data.geom"]
     pub fn push(&mut self, tri: MeshTri) {
         self.push_aa(tri, AA_ALL);
     }
@@ -183,6 +190,8 @@ impl<'a> ListBuilder<'a> {
     /// Adds one view-space triangle with an explicit silhouette-edge mask
     /// (see [`ScreenTri::aa`]); pass 0 for a triangle whose every edge is
     /// shared with a neighbour, e.g. a terrain cell.
+    #[link_section = ".data.geom"]
+    #[inline(never)]
     pub fn push_aa(&mut self, tri: MeshTri, aa: u8) {
         let color = embedded_graphics::pixelcolor::raw::RawU16::from(tri.color).into_inner();
 
@@ -203,6 +212,7 @@ impl<'a> ListBuilder<'a> {
 
     /// Adds a quad `[a, b, c, d]` as two triangles with only its four outer
     /// edges anti-aliased (the diagonal is shared).
+    #[link_section = ".data.geom"]
     pub fn push_quad(&mut self, v: [Vec3; 4], color: Rgb565) {
         let [a, b, c, d] = v;
         self.push_aa(MeshTri { v: [a, b, c], color }, 0b011);
@@ -214,6 +224,7 @@ impl<'a> ListBuilder<'a> {
     /// `color` the tint the tile's shade levels are derived from. Near-plane
     /// clipped like a flat triangle, interpolating the coordinates; never
     /// anti-aliased (the patch's edges are all shared or off-screen).
+    #[link_section = ".data.geom"]
     pub fn push_ground(&mut self, tri: [Vec3; 3], uv: [[f32; 2]; 3], color: Rgb565) {
         let color = embedded_graphics::pixelcolor::raw::RawU16::from(color).into_inner();
         let mut poly = [(Vec3::default(), [0.0f32; 2]); 4];
@@ -263,6 +274,8 @@ impl<'a> ListBuilder<'a> {
     /// face the camera): a quad straddling the near plane is dropped whole —
     /// they are small and sit near the tree, so this only happens for a frame
     /// or two when zoomed in hard.
+    #[link_section = ".data.geom"]
+    #[inline(never)]
     pub fn push_sprite(&mut self, corners: [Vec3; 3], tex: u8, color: Rgb565) {
         if corners.iter().any(|c| c.z < NEAR) || self.out.len == MAX_TRIS {
             return;
@@ -287,6 +300,8 @@ impl<'a> ListBuilder<'a> {
 
     /// Sorts far-to-near (painter's algorithm) and ends the frame: an LSD
     /// radix sort on the 16-bit depth, two 8-bit passes, descending.
+    #[link_section = ".data.geom"]
+    #[inline(never)]
     pub fn finish(self) {
         let n = self.out.len;
         let out = &mut *self.out;
@@ -300,6 +315,7 @@ impl<'a> ListBuilder<'a> {
 
 /// One stable counting-sort pass on the byte at `shift`, descending, so
 /// after the low byte then the high byte the keys are far-to-near.
+#[link_section = ".data.geom"]
 fn radix_pass(src: &[u32], dst: &mut [u32], shift: u32) {
     let mut counts = [0u32; 256];
     for &k in src {
@@ -321,12 +337,14 @@ fn radix_pass(src: &[u32], dst: &mut [u32], shift: u32) {
 
 /// Scales an RGB565 color by `f`, clamping each channel (used by emitters to
 /// bake lighting and tone variants at generation time).
+#[link_section = ".data.geom"]
 pub fn tint(color: Rgb565, f: f32) -> Rgb565 {
     let ch = |v: u8, max: u8| ((f32::from(v)) * f).min(f32::from(max)) as u8;
     Rgb565::new(ch(color.r(), 31), ch(color.g(), 63), ch(color.b(), 31))
 }
 
 /// Projects one clipped view-space triangle and appends it if front-facing.
+#[link_section = ".data.geom"]
 fn emit(out: &mut TriList, [a, b, c]: [Vec3; 3], color: u16, tex: u8, aa: u8) {
     if out.len == MAX_TRIS {
         return;
@@ -354,10 +372,12 @@ fn emit(out: &mut TriList, [a, b, c]: [Vec3; 3], color: u16, tex: u8, aa: u8) {
 }
 
 /// Painter's sort key: 2048 units/step covers a ~0.1..32 unit scene in u16.
+#[link_section = ".data.geom"]
 fn depth_key(z: f32) -> u16 {
     (z * 2048.0).clamp(0.0, 65535.0) as u16
 }
 
+#[link_section = ".data.geom"]
 fn project(v: Vec3) -> (f32, f32) {
     let inv_z = 1.0 / v.z;
     (
@@ -368,6 +388,7 @@ fn project(v: Vec3) -> (f32, f32) {
 
 /// [`clip_near`] carrying per-vertex texture coordinates (linear in view
 /// space, so plain interpolation is exact).
+#[link_section = ".data.geom"]
 fn clip_near_uv(tri: &[Vec3; 3], uv: &[[f32; 2]; 3], out: &mut [(Vec3, [f32; 2]); 4]) -> usize {
     let mut n = 0;
     for i in 0..3 {
@@ -394,6 +415,7 @@ fn clip_near_uv(tri: &[Vec3; 3], uv: &[[f32; 2]; 3], out: &mut [(Vec3, [f32; 2])
 
 /// Clips a triangle against the near plane, writing the result into `out`.
 /// Returns the vertex count (0 when fully behind, 3 or 4 otherwise).
+#[link_section = ".data.geom"]
 fn clip_near(tri: &[Vec3; 3], out: &mut [Vec3; 4]) -> usize {
     let mut n = 0;
     for i in 0..3 {

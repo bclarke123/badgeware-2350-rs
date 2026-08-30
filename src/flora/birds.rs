@@ -72,6 +72,8 @@ impl Flock {
     }
 
     /// Emits active birds (view space, far depth — occluded by everything).
+    #[link_section = ".data.geom"]
+    #[inline(never)]
     pub fn emit(&self, time_s: f32, out: &mut ListBuilder<'_>) {
         for bird in self.birds.iter().filter(|b| b.active) {
             // Wing flap plus a slight flight bob on the same clock; smaller
