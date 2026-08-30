@@ -99,7 +99,7 @@ pub async fn run(
     let mut split_x: usize = 176;
     const LOG_FRAMES: u32 = 120;
     let mut sum_geom = 0u64;
-    let (mut sum_flat, mut sum_sprite, mut sum_clear) = (0u64, 0u64, 0u64);
+    let (mut sum_flat, mut sum_sprite, mut sum_clear, mut sum_ground) = (0u64, 0u64, 0u64, 0u64);
     let (mut sum_wait, mut sum_dma, mut sum_join) = (0u64, 0u64, 0u64);
     let (mut sum_draw0, mut sum_c1wait, mut sum_c1draw) = (0u64, 0u64, 0u64);
     let mut clear_cache = crate::render3d::raster::ClearCache::new();
@@ -199,7 +199,7 @@ pub async fn run(
         let mut builder = ListBuilder::new_view_space(tri_list);
         push_stars(&mut builder, &stars, night, time_s, sky_top);
         flock.emit(time_s, &mut builder);
-        the_terrain.emit(&view, 1.0 - 0.55 * night, &mut builder);
+        the_terrain.emit(&view, 1.0 - 0.55 * night, sky_bottom, &mut builder);
         the_tree.emit(&view, growth_elapsed, time_s, tree_scale, 0, &mut builder);
         builder.finish();
         join_or_panic("geom").await;
@@ -266,6 +266,7 @@ pub async fn run(
         sum_c1draw += t_c1draw;
         sum_flat += u64::from(stats.flat_us);
         sum_sprite += u64::from(stats.sprite_us);
+        sum_ground += u64::from(stats.ground_us);
         sum_clear += u64::from(stats.clear_us);
         sum_wait += t_wait;
         sum_dma += t_dma;
@@ -279,7 +280,7 @@ pub async fn run(
             // split_x right; large => move it left). The flat/sprite/clear
             // split is core 0's part only.
             log::info!(
-                "frame: vsync {} geom {} dma {} c0 {} c1 {}+{} join {} split {} (c0: clear {} flat {} sprite {}) ({} prims)",
+                "frame: vsync {} geom {} dma {} c0 {} c1 {}+{} join {} split {} (c0: clear {} flat {} sprite {} ground {}) ({} prims)",
                 sum_wait / u64::from(frames),
                 sum_geom / u64::from(frames),
                 sum_dma / u64::from(frames),
@@ -291,11 +292,12 @@ pub async fn run(
                 sum_clear / u64::from(frames),
                 sum_flat / u64::from(frames),
                 sum_sprite / u64::from(frames),
+                sum_ground / u64::from(frames),
                 tri_list.len + tri_list_b.len,
             );
             (sum_geom, sum_flat, sum_sprite, sum_clear, sum_wait, sum_dma, sum_join, frames) =
                 (0, 0, 0, 0, 0, 0, 0, 0);
-            (sum_draw0, sum_c1wait, sum_c1draw) = (0, 0, 0);
+            (sum_draw0, sum_c1wait, sum_c1draw, sum_ground) = (0, 0, 0, 0);
         }
     }
 }

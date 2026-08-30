@@ -59,14 +59,32 @@ pub const fn content_rect(shape: u8) -> [f32; 4] {
     }
 }
 
-/// All maps: `maps[shape * 2]` is 16x16, `maps[shape * 2 + 1]` the 8x8 mip.
+/// Number of ground mip levels: 64, 32, 16, 8 texels per world unit.
+pub const GROUND_LEVELS: usize = 4;
+/// Side of the largest ground map.
+pub const GROUND_SIDE: usize = 64;
+/// Shade levels in a ground map (texel values `0..GROUND_SHADES`).
+pub const GROUND_SHADES: usize = 8;
+
+/// One ground tile mip: a `2^log2`-sided map of shade levels 0..=7, tiling
+/// one world unit. No transparency — every texel is ground.
+#[derive(Clone, Copy)]
+pub struct GroundMap {
+    pub log2: u8,
+    pub data: [u8; GROUND_SIDE * GROUND_SIDE],
+}
+
+/// All maps: `maps[shape * 2]` is 16x16, `maps[shape * 2 + 1]` the 8x8 mip;
+/// `ground[level]` is the grass tile at 64 >> level texels per unit.
 pub struct Textures {
     pub maps: [TexMap; SHAPES * 2],
+    pub ground: [GroundMap; GROUND_LEVELS],
 }
 
 impl Textures {
     pub const EMPTY: Textures = Textures {
         maps: [TexMap { log2: 4, data: [0; MAX_TEXELS] }; SHAPES * 2],
+        ground: [GroundMap { log2: 6, data: [0; GROUND_SIDE * GROUND_SIDE] }; GROUND_LEVELS],
     };
 
     /// Generates every map. Call once at boot, before core 1 rasterizes.
@@ -75,6 +93,11 @@ impl Textures {
         for (shape, f) in shapes.iter().enumerate() {
             bake(&mut self.maps[shape * 2], 4, *f);
             bake(&mut self.maps[shape * 2 + 1], 3, *f);
+        }
+        bake_grass(&mut self.ground[0]);
+        for level in 1..GROUND_LEVELS {
+            let (lo, hi) = self.ground.split_at_mut(level);
+            downsample(&lo[level - 1], &mut hi[0]);
         }
     }
 
@@ -202,6 +225,88 @@ fn tuft(x: f32, y: f32) -> u8 {
         }
     }
     shade
+}
+
+/// The grass tile: three octaves of tiling value noise quantized to eight
+/// shade levels (soft light/dark patches), then sparse two-texel vertical
+/// "blade" flecks. Everything tiles at the map's period so the world-space
+/// mapping never shows a seam.
+fn bake_grass(map: &mut GroundMap) {
+    const SIDE: usize = GROUND_SIDE;
+    map.log2 = 6;
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    let mut field = [0f32; SIDE * SIDE];
+    for (i, v) in field.iter_mut().enumerate() {
+        let (x, y) = ((i % SIDE) as f32, (i / SIDE) as f32);
+        // Octave lattices of 8, 16 and 32 cells across the tile.
+        let n = value_noise(x, y, 8, 1) + 0.5 * value_noise(x, y, 16, 2) + 0.3 * value_noise(x, y, 32, 3);
+        lo = lo.min(n);
+        hi = hi.max(n);
+        *v = n;
+    }
+    let span = (hi - lo).max(1e-3);
+    for (i, &n) in field.iter().enumerate() {
+        let level = ((n - lo) / span * (GROUND_SHADES as f32 - 0.01)) as u8;
+        map.data[i] = level.min(GROUND_SHADES as u8 - 1);
+    }
+    // Blade flecks: ~6% of texels start a bright or dark 2-texel dash.
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let h = hash(x as u32, y as u32, 7);
+            if h % 100 < 6 {
+                let delta: i32 = if h & 0x100 != 0 { 2 } else { -2 };
+                for dy in 0..2 {
+                    let i = ((y + dy) % SIDE) * SIDE + x;
+                    map.data[i] = (i32::from(map.data[i]) + delta).clamp(0, GROUND_SHADES as i32 - 1) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Halves a ground map by averaging 2x2 texel shade levels — the far mips
+/// go smooth rather than sparkling.
+fn downsample(src: &GroundMap, dst: &mut GroundMap) {
+    let s_side = 1usize << src.log2;
+    let d_side = s_side / 2;
+    dst.log2 = src.log2 - 1;
+    for y in 0..d_side {
+        for x in 0..d_side {
+            let at = |dx: usize, dy: usize| u32::from(src.data[(2 * y + dy) * s_side + 2 * x + dx]);
+            let sum = at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1);
+            dst.data[y * d_side + x] = ((sum + 2) / 4) as u8;
+        }
+    }
+}
+
+/// Tiling value noise: a `cells`-wide lattice of hashed values over a
+/// [`GROUND_SIDE`] period, smoothstep-interpolated.
+fn value_noise(x: f32, y: f32, cells: u32, seed: u32) -> f32 {
+    let scale = cells as f32 / GROUND_SIDE as f32;
+    let (fx, fy) = (x * scale, y * scale);
+    let (x0, y0) = (fx as u32, fy as u32);
+    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+    let (sx, sy) = (tx * tx * (3.0 - 2.0 * tx), ty * ty * (3.0 - 2.0 * ty));
+    let at = |i: u32, j: u32| (hash(i % cells, j % cells, seed) & 0xffff) as f32 / 65535.0;
+    let a = at(x0, y0);
+    let b = at(x0 + 1, y0);
+    let c = at(x0, y0 + 1);
+    let d = at(x0 + 1, y0 + 1);
+    let top = a + (b - a) * sx;
+    let bottom = c + (d - c) * sx;
+    top + (bottom - top) * sy
+}
+
+/// Small integer hash (Wang-style mix) for noise lattices.
+fn hash(x: u32, y: u32, seed: u32) -> u32 {
+    let mut h = x.wrapping_mul(0x27d4_eb2d) ^ y.wrapping_mul(0x1656_67b1) ^ seed.wrapping_mul(0x9e37_79b9);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2c1b_3c6d);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x297a_2d39);
+    h ^= h >> 15;
+    h
 }
 
 /// `x^0.75` for `x` in 0..=1 (`sqrt(x) * sqrt(sqrt(x))`), 0 below.

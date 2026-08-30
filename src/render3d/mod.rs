@@ -73,6 +73,25 @@ fn x_range(min: f32, max: f32) -> [u8; 2] {
 /// Every edge anti-aliased (a free-standing triangle).
 pub const AA_ALL: u8 = 0b111;
 
+/// `ScreenTri::tex` value marking a perspective-textured ground triangle;
+/// its `aa` field then indexes [`TriList::ground`].
+pub const GROUND_TEX: u8 = 0xFF;
+
+/// Ground triangles per list (a 7x7 cell patch is 98, plus near-clip fans).
+pub const MAX_GROUND: usize = 160;
+
+/// Per-vertex perspective attributes of a ground triangle, in the same
+/// vertex order as its [`ScreenTri`]: `u/z`, `v/z`, `1/z` (u, v in world
+/// units — one grass tile per unit — and z the view depth). All three are
+/// affine in screen space, which is what makes perspective-correct
+/// texturing a reciprocal per pixel chunk (see [`raster`]).
+#[derive(Debug, Clone, Copy)]
+pub struct GroundAttr {
+    pub uz: [f32; 3],
+    pub vz: [f32; 3],
+    pub iz: [f32; 3],
+}
+
 impl ScreenTri {
     const ZERO: ScreenTri = ScreenTri {
         x: [0.0; 3],
@@ -100,6 +119,9 @@ pub struct TriList {
     pub order: [u32; MAX_TRIS],
     /// Radix-sort scratch.
     scratch: [u32; MAX_TRIS],
+    /// Attributes of ground triangles (indexed by their `aa` field).
+    pub ground: [GroundAttr; MAX_GROUND],
+    pub ground_len: usize,
 }
 
 impl TriList {
@@ -108,6 +130,8 @@ impl TriList {
         len: 0,
         order: [0; MAX_TRIS],
         scratch: [0; MAX_TRIS],
+        ground: [GroundAttr { uz: [0.0; 3], vz: [0.0; 3], iz: [0.0; 3] }; MAX_GROUND],
+        ground_len: 0,
     };
 
     /// The `i`-th primitive in painter's (far-to-near) order.
@@ -147,6 +171,7 @@ impl<'a> ListBuilder<'a> {
     /// Starts a new frame of view-space triangles.
     pub fn new_view_space(out: &'a mut TriList) -> Self {
         out.len = 0;
+        out.ground_len = 0;
         Self { out }
     }
 
@@ -182,6 +207,50 @@ impl<'a> ListBuilder<'a> {
         let [a, b, c, d] = v;
         self.push_aa(MeshTri { v: [a, b, c], color }, 0b011);
         self.push_aa(MeshTri { v: [a, c, d], color }, 0b110);
+    }
+
+    /// Adds a perspective-textured ground triangle: `uv` are world-unit
+    /// texture coordinates per vertex (the grass tile repeats every unit),
+    /// `color` the tint the tile's shade levels are derived from. Near-plane
+    /// clipped like a flat triangle, interpolating the coordinates; never
+    /// anti-aliased (the patch's edges are all shared or off-screen).
+    pub fn push_ground(&mut self, tri: [Vec3; 3], uv: [[f32; 2]; 3], color: Rgb565) {
+        let color = embedded_graphics::pixelcolor::raw::RawU16::from(color).into_inner();
+        let mut poly = [(Vec3::default(), [0.0f32; 2]); 4];
+        let n = clip_near_uv(&tri, &uv, &mut poly);
+        if n < 3 {
+            return;
+        }
+        for i in 1..n - 1 {
+            let (a, b, c) = (poly[0], poly[i], poly[i + 1]);
+            let out = &mut *self.out;
+            if out.len == MAX_TRIS || out.ground_len == MAX_GROUND {
+                return;
+            }
+            let (ax, ay) = project(a.0);
+            let (bx, by) = project(b.0);
+            let (cx, cy) = project(c.0);
+            if (bx - ax) * (cy - ay) - (by - ay) * (cx - ax) <= 0.0 {
+                continue;
+            }
+            let iz = [1.0 / a.0.z, 1.0 / b.0.z, 1.0 / c.0.z];
+            out.ground[out.ground_len] = GroundAttr {
+                uz: [a.1[0] * iz[0], b.1[0] * iz[1], c.1[0] * iz[2]],
+                vz: [a.1[1] * iz[0], b.1[1] * iz[1], c.1[1] * iz[2]],
+                iz,
+            };
+            out.tris[out.len] = ScreenTri {
+                x: [ax, bx, cx],
+                y: [ay, by, cy],
+                depth: depth_key((a.0.z + b.0.z + c.0.z) * (1.0 / 3.0)),
+                color,
+                tex: GROUND_TEX,
+                aa: out.ground_len as u8,
+                xr: x_range(ax.min(bx).min(cx), ax.max(bx).max(cx)),
+            };
+            out.ground_len += 1;
+            out.len += 1;
+        }
     }
 
     /// Adds a textured billboard sprite: `corners` are the view-space
@@ -295,6 +364,32 @@ fn project(v: Vec3) -> (f32, f32) {
         WIDTH as f32 * 0.5 + FOCAL * v.x * inv_z,
         HEIGHT as f32 * 0.5 - FOCAL * v.y * inv_z,
     )
+}
+
+/// [`clip_near`] carrying per-vertex texture coordinates (linear in view
+/// space, so plain interpolation is exact).
+fn clip_near_uv(tri: &[Vec3; 3], uv: &[[f32; 2]; 3], out: &mut [(Vec3, [f32; 2]); 4]) -> usize {
+    let mut n = 0;
+    for i in 0..3 {
+        let j = (i + 1) % 3;
+        let (cur, next) = (tri[i], tri[j]);
+        let cur_in = cur.z >= NEAR;
+        let next_in = next.z >= NEAR;
+        if cur_in {
+            out[n] = (cur, uv[i]);
+            n += 1;
+        }
+        if cur_in != next_in {
+            let t = (NEAR - cur.z) / (next.z - cur.z);
+            let lerp = |a: f32, b: f32| a + (b - a) * t;
+            out[n] = (
+                cur.add(next.sub(cur).scale(t)),
+                [lerp(uv[i][0], uv[j][0]), lerp(uv[i][1], uv[j][1])],
+            );
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Clips a triangle against the near plane, writing the result into `out`.
