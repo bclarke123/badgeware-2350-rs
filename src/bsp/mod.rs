@@ -9,6 +9,8 @@
 
 #[cfg(feature = "tufty")]
 pub mod backlight;
+#[cfg(feature = "badger")]
+pub mod battery;
 pub mod buttons;
 #[cfg(feature = "tufty")]
 pub mod display;

@@ -11,6 +11,7 @@
 
 pub mod dither;
 pub mod grey;
+pub mod widgets;
 
 use embedded_graphics::pixelcolor::raw::RawU16;
 use embedded_graphics::pixelcolor::Rgb565;

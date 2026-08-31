@@ -43,6 +43,7 @@ use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::{fonts, FontRenderer};
 
 use tufty_2350::bsp;
+use tufty_2350::bsp::battery::Battery;
 use tufty_2350::bsp::buttons::{Button, ButtonEvent, ButtonPins, EVENTS};
 use tufty_2350::bsp::epd::{Epd, Speed};
 use tufty_2350::bsp::leds::RearLeds;
@@ -52,6 +53,7 @@ use tufty_2350::bsp::settings::{Settings, MAX_VAL};
 use tufty_2350::bsp::wifi;
 use tufty_2350::gfx::dither::{self, Method};
 use tufty_2350::gfx::grey::Grey;
+use tufty_2350::gfx::widgets::draw_battery;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
@@ -119,6 +121,7 @@ async fn main(spawner: Spawner) {
 
     let mut rtc = RtcRam::new(p.I2C0, p.PIN_5, p.PIN_4);
     let mut settings = Settings::new(p.FLASH);
+    let mut battery = Battery::new(p.ADC, p.PIN_26, p.PIN_28, p.PIN_12);
 
     let levels = LEVELS.take();
     let mut canvas = Grey::new(WIDTH, HEIGHT, CANVAS.take());
@@ -178,7 +181,8 @@ async fn main(spawner: Spawner) {
         match report {
             Some(r) => {
                 let clock = rtc.read_datetime();
-                draw_report(&mut canvas, levels, &r, clock.as_ref());
+                let power = (battery.percent(), battery.on_usb());
+                draw_report(&mut canvas, levels, &r, clock.as_ref(), power);
                 epd.present_levels(levels).await;
             }
             None => {
@@ -542,7 +546,13 @@ fn draw_icon(canvas: &mut Grey<'_>, r: &Report, local_hour: u8) {
 }
 
 /// The report screen.
-fn draw_report(canvas: &mut Grey<'_>, levels: &mut [u8], r: &Report, clock: Option<&DateTime>) {
+fn draw_report(
+    canvas: &mut Grey<'_>,
+    levels: &mut [u8],
+    r: &Report,
+    clock: Option<&DateTime>,
+    (batt_pct, on_usb): (u8, bool),
+) {
     canvas.fill(255);
     let big = FontRenderer::new::<fonts::u8g2_font_logisoso42_tf>();
     let title = FontRenderer::new::<fonts::u8g2_font_crox5hb_tf>();
@@ -591,6 +601,19 @@ fn draw_report(canvas: &mut Grey<'_>, levels: &mut [u8], r: &Report, clock: Opti
         FontColor::Transparent(BLACK),
         canvas,
     );
+    // Battery bottom-left, opposite the updated stamp.
+    draw_battery(canvas, Point::new(6, 163), batt_pct, on_usb);
+    let mut pct = heapless::String::<8>::new();
+    let _ = write!(pct, "{}%", batt_pct);
+    let _ = small.render_aligned(
+        pct.as_str(),
+        Point::new(34, 172),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Left,
+        FontColor::Transparent(BLACK),
+        canvas,
+    );
+
     // Local time from the RTC (UTC) plus the geolocated offset.
     let local = clock.map(|t| {
         let secs = (i64::from(t.unix() as u32) + i64::from(r.utc_offset)).rem_euclid(86400);
