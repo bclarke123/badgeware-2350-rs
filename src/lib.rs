@@ -11,8 +11,10 @@
 
 pub mod boot;
 pub mod bsp;
+#[cfg(not(feature = "badger2040w"))]
 pub mod flora;
 pub mod gfx;
+#[cfg(not(feature = "badger2040w"))]
 pub mod render3d;
 
 // Rust guideline compliant 2026-08-30

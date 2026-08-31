@@ -14,8 +14,12 @@ use embassy_rp::flash::{Blocking, Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
 use embassy_rp::Peri;
 
-/// Total flash size (both boards ship 16 MiB).
+/// Total flash size (the RP2350 boards ship 16 MiB; the Badger 2040 W's
+/// Pico W has 2 MiB).
+#[cfg(not(feature = "badger2040w"))]
 const FLASH_SIZE: usize = 16 * 1024 * 1024;
+#[cfg(feature = "badger2040w")]
+const FLASH_SIZE: usize = 2 * 1024 * 1024;
 
 /// Offset of the settings sector: the last erase block.
 const OFFSET: u32 = (FLASH_SIZE - ERASE_SIZE) as u32;
@@ -101,12 +105,15 @@ impl Settings {
         out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
         out[4..8].copy_from_slice(&count.to_le_bytes());
         let end = n.next_multiple_of(4);
-        // The ROM flash helpers reset the QMI's PSRAM window; put it back.
+        // The RP2350 ROM flash helpers reset the QMI's PSRAM window; put
+        // it back (the RP2040 has no PSRAM controller to protect).
+        #[cfg(not(feature = "badger2040w"))]
         let m1 = super::psram::m1_save();
         let ok = self
             .flash
             .blocking_erase(OFFSET, OFFSET + ERASE_SIZE as u32)
             .and_then(|()| self.flash.blocking_write(OFFSET, &out[..end]));
+        #[cfg(not(feature = "badger2040w"))]
         super::psram::m1_restore(&m1);
         if let Err(e) = ok {
             log::warn!("settings write failed: {:?}", e);

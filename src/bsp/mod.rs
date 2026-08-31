@@ -16,8 +16,12 @@ pub mod buttons;
 pub mod display;
 #[cfg(feature = "badger")]
 pub mod epd;
+#[cfg(feature = "badger2040w")]
+pub mod epd_mono;
 pub mod leds;
+#[cfg(not(feature = "badger2040w"))]
 pub mod power;
+#[cfg(not(feature = "badger2040w"))]
 pub mod psram;
 pub mod rtc;
 pub mod settings;

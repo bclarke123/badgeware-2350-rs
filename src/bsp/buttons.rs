@@ -36,13 +36,16 @@ pub enum ButtonEvent {
 /// events are dropped (not blocked on) if it ever fills.
 pub static EVENTS: Channel<CriticalSectionRawMutex, ButtonEvent, 16> = Channel::new();
 
-/// The button GPIOs (all active low).
+/// The button GPIOs (active low on the RP2350 boards; the Badger 2040 W's
+/// are active high and it has no HOME button — reflash via its physical
+/// BOOTSEL button instead).
 pub struct ButtonPins {
     pub a: Input<'static>,
     pub b: Input<'static>,
     pub c: Input<'static>,
     pub up: Input<'static>,
     pub down: Input<'static>,
+    #[cfg(not(feature = "badger2040w"))]
     pub home: Input<'static>,
 }
 
@@ -52,6 +55,7 @@ pub struct ButtonPins {
 const POLL_PERIOD: Duration = Duration::from_millis(10);
 
 /// HOME held for this many consecutive polls (2 s) triggers a BOOTSEL reboot.
+#[cfg(not(feature = "badger2040w"))]
 const HOME_HOLD_POLLS: u32 = 200;
 
 /// Polls, debounces, and publishes button events forever.
@@ -63,6 +67,7 @@ pub async fn button_task(pins: ButtonPins) -> ! {
         (Button::C, &pins.c),
         (Button::Up, &pins.up),
         (Button::Down, &pins.down),
+        #[cfg(not(feature = "badger2040w"))]
         (Button::Home, &pins.home),
     ];
 
@@ -70,13 +75,19 @@ pub async fn button_task(pins: ButtonPins) -> ! {
     // Debounce state per button: last raw sample and the accepted stable state.
     let mut last_raw = [false; 6];
     let mut stable = [false; 6];
+    #[cfg(not(feature = "badger2040w"))]
     let mut home_held_polls: u32 = 0;
+    #[cfg(feature = "badger2040w")]
+    let mut updown_held_polls: u32 = 0;
 
     loop {
         ticker.next().await;
 
         for (i, (button, pin)) in buttons.iter().enumerate() {
+            #[cfg(not(feature = "badger2040w"))]
             let raw = pin.is_low(); // active low: low = pressed
+            #[cfg(feature = "badger2040w")]
+            let raw = pin.is_high(); // active high: high = pressed
             if raw == last_raw[i] && raw != stable[i] {
                 stable[i] = raw;
                 let event = if raw {
@@ -92,6 +103,7 @@ pub async fn button_task(pins: ButtonPins) -> ! {
         }
 
         // Long-press HOME: reboot to BOOTSEL for cable-only reflashing.
+        #[cfg(not(feature = "badger2040w"))]
         if stable[5] {
             home_held_polls += 1;
             if home_held_polls == HOME_HOLD_POLLS {
@@ -103,6 +115,20 @@ pub async fn button_task(pins: ButtonPins) -> ! {
             }
         } else {
             home_held_polls = 0;
+        }
+
+        // The Badger 2040 W has no HOME: holding UP and DOWN together for
+        // two seconds reboots to BOOTSEL instead.
+        #[cfg(feature = "badger2040w")]
+        if stable[3] && stable[4] {
+            updown_held_polls += 1;
+            if updown_held_polls == 200 {
+                log::info!("UP+DOWN held; rebooting to BOOTSEL");
+                embassy_time::Timer::after_millis(50).await;
+                crate::boot::reboot_to_bootsel();
+            }
+        } else {
+            updown_held_polls = 0;
         }
     }
 }

@@ -1,20 +1,24 @@
 # badgeware-2350-rs
 
 Rust/[Embassy](https://embassy.dev) firmware for [Pimoroni's Badgeware](https://shop.pimoroni.com/collections/badgeware)
-family of RP2350 badges — no MicroPython, no interpreter, no heap; single
-static binaries straight on the metal.
+family of badges (and their RP2040 ancestor) — no MicroPython, no
+interpreter, no heap; single static binaries straight on the metal.
 
 | Board | Screen | Status |
 |---|---|---|
 | [Tufty 2350](https://github.com/pimoroni/tufty2350) | 2.8" 320×240 ST7789 LCD, 8-bit parallel | supported (`--features tufty`, default) |
 | [Badger 2350](https://github.com/pimoroni/badger2350) | 2.7" 264×176 SSD1680 four-grey e-paper | supported (`--features badger`) |
+| [Badger 2040 W](https://shop.pimoroni.com/products/badger-2040-w) | 2.9" 296×128 UC8151 mono e-paper | supported (`--features badger2040w`, RP2040) |
 | Blinky 2350 | 39×26 white LED matrix | in the post |
 
 One library crate (`bsp` drivers, `gfx` greyscale pipeline, `render3d`
 software renderer, `flora` scene, `boot` plumbing); every app is a binary in
-`examples/`. The boards share their buttons, rear LEDs, RTC, RM2 radio and
-power path, so most examples are a feature flag away from each other's
-hardware.
+`examples/`. The RP2350 boards share their buttons, rear LEDs, RTC, RM2
+radio and power path, so most examples are a feature flag away from each
+other's hardware — and the first-generation Badger 2040 W (a whole different
+chip: RP2040, Cortex-M0+, no FPU) rides the same crate through the same
+seams, since everything network- and e-paper-shaped needs no floating point
+worth mentioning.
 
 ## Examples
 
@@ -29,6 +33,7 @@ hardware.
 | `chess` | badger | Play White against Stockfish at chess-api.com over TLS 1.3. `cozy-chess` legal moves on five buttons, eval + captured pieces in the panel, game persisted across power-off. |
 | `marquee` | badger | Concert beacon: hold A and the badge becomes a hotspot with a join-QR; your phone's captive-portal sheet pops a form, and the message renders as big as it fits. No app, no shared network, no typed URLs. |
 | `reader` | badger | E-reader: streams a Project Gutenberg book over TLS into the 8 MB PSRAM (progress bar included), then pages it on the e-paper — word wrap, typography cleanup, persistent bookmark, page-up/-down from any point. |
+| `mono_test` | badger2040w | 1-bit test card for the Badger 2040 W: a grey ramp under selectable dithers, hairline/checker/disc swatches, all four UC8151 waveform speeds with measured times over serial, invert-to-check-ghosting. |
 
 ## Building & flashing (no debug probe needed)
 
@@ -37,8 +42,13 @@ Prerequisites: Rust stable with the `thumbv8m.main-none-eabihf` target
 
 ```sh
 cargo run --release --example tree                                            # Tufty
-cargo run --release --example weather --no-default-features --features badger # Badger
+cargo run --release --example weather --no-default-features --features badger # Badger 2350
+cargo run --release --example mono_test --no-default-features \
+    --features badger2040w --target thumbv6m-none-eabi                        # Badger 2040 W
 ```
+
+(The RP2040 board needs the explicit `--target` — Cargo features can't
+switch architectures.)
 
 1. **First flash:** hold the BOOT button while plugging in USB — the badge
    mounts as the `RP2350` bootloader — then run the command above. (On a
@@ -46,7 +56,8 @@ cargo run --release --example weather --no-default-features --features badger # 
    its MicroPython REPL does the same; this firmware replaces BadgeOS, which
    is restored by flashing Pimoroni's release `.uf2`.)
 2. **Every flash after that:** hold **HOME for 2 seconds** on the running
-   firmware to reboot into BOOTSEL, then run the command again. Panics and
+   firmware (**UP+DOWN together** on the Badger 2040 W, which has no HOME)
+   to reboot into BOOTSEL, then run the command again. Panics and
    hard faults also end in BOOTSEL (after a ~5 s pause), so a badge is never
    bricked — if one seems dead, it may just be waiting in the bootloader.
 
@@ -151,6 +162,22 @@ stored in panel scan order (portrait, column-major — `src/gfx` pays the
 transpose per pixel write), and presents wait for the TE pulse so the write
 outruns the refresh beam: tear-free without double buffering.
 
+### Badger 2040 W notes
+
+The first-generation WiFi badge is a Pico W soldered to an e-paper shield,
+and it ports surprisingly cleanly: the radio is the textbook `cyw43` target,
+the RTC is the same PCF85063A, and the power story is even better than
+POWMAN — an `EN_3V3` latch (GPIO10) the firmware holds high and drops to
+power off *completely*, with any front button or the RTC alarm switching it
+back on. Its UC8151 panel is strictly 1-bit, but its fast waveforms are the
+real thing: the Turbo refresh (~250 ms measured) stays clean in a way the
+2350 Badger's four-grey SSD1680 can't match — this is the board for
+anything that updates often. `gfx/dither` quantizes to the panel through
+the same Bayer/Floyd–Steinberg machinery at a 50 % linear-light threshold.
+What stays behind: the 3D renderer (no FPU), PSRAM (none fitted), and the
+four greys. Buttons are active high on this board, and first-time flashing
+uses the BOOTSEL button on the Pico W module itself.
+
 ## The Badger pipeline
 
 The SSD1680 driver ports Pimoroni's four-grey waveform verbatim; full
@@ -190,6 +217,8 @@ this repo's own tiny DHCP/DNS/HTTP servers for phone-based setup.
 
 ## Roadmap
 
+- **Badger 2040 W apps**: the weather station and friends need only the
+  mono present path swapped in — the port's plumbing is done.
 - **Blinky 2350 bring-up**: matrix driver, scrolling marquee port (same
   captive-portal plumbing, open-AP short-SSID join QR, instant display
   toggle on B), greyscale-glow demos.

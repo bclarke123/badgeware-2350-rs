@@ -186,6 +186,70 @@ pub fn quantize(src: &Grey<'_>, rect: Rectangle, method: Method, levels: &mut [u
     }
 }
 
+/// Quantizes `rect` of `src` to two levels (0 black, 1 white) for 1-bit
+/// panels, in linear light. The four-grey [`quantize`] leans on the panel
+/// calibration; mono has no calibration to lean on, just a 50% threshold.
+pub fn quantize_mono(src: &Grey<'_>, rect: Rectangle, method: Method, levels: &mut [u8]) {
+    let w = src.width();
+    let area = rect.intersection(&Rectangle::new(
+        embedded_graphics::prelude::Point::zero(),
+        embedded_graphics::prelude::Size::new(w as u32, src.height() as u32),
+    ));
+    if area.size.width == 0 || area.size.height == 0 {
+        return;
+    }
+    let (x0, y0) = (area.top_left.x as usize, area.top_left.y as usize);
+    let (x1, y1) = (x0 + area.size.width as usize, y0 + area.size.height as usize);
+
+    match method {
+        Method::Nearest => {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    levels[y * w + x] = u8::from(to_linear(src.get(x, y)) > 2047);
+                }
+            }
+        }
+        Method::Ordered4 => {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let t = u32::from(BAYER4[y & 3][x & 3]) * 256 + 128 - 1;
+                    levels[y * w + x] = u8::from(u32::from(to_linear(src.get(x, y))) > t);
+                }
+            }
+        }
+        Method::Ordered8 => {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let t = bayer8_threshold(x, y);
+                    levels[y * w + x] = u8::from(u32::from(to_linear(src.get(x, y))) > t);
+                }
+            }
+        }
+        Method::FloydSteinberg => {
+            assert!(w <= MAX_WIDTH, "canvas too wide for the diffusion buffers");
+            let mut err = [[0i32; MAX_WIDTH + 2]; 2];
+            for y in y0..y1 {
+                let (cur, next) = {
+                    let (a, b) = err.split_at_mut(1);
+                    (&mut a[0], &mut b[0])
+                };
+                next.fill(0);
+                for x in x0..x1 {
+                    let lin = i32::from(to_linear(src.get(x, y))) + cur[x + 1];
+                    let level = u8::from(lin > 2047);
+                    let e = lin - if level == 1 { 4095 } else { 0 };
+                    levels[y * w + x] = level;
+                    cur[x + 2] += e * 7 / 16;
+                    next[x] += e * 3 / 16;
+                    next[x + 1] += e * 5 / 16;
+                    next[x + 2] += e / 16;
+                }
+                err.swap(0, 1);
+            }
+        }
+    }
+}
+
 /// Writes one level directly into a rect of `levels` (for calibration
 /// swatches and anything that must bypass quantization).
 pub fn paint_level(levels: &mut [u8], width: usize, rect: Rectangle, level: u8) {

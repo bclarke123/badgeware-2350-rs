@@ -8,7 +8,11 @@
 //! `cyw43::aligned_bytes!`.
 
 use cyw43::{Control, JoinOptions, NetDriver, SpiBus, State};
-use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
+#[cfg(feature = "badger2040w")]
+use cyw43_pio::DEFAULT_CLOCK_DIVIDER as RM2_CLOCK_DIVIDER;
+#[cfg(not(feature = "badger2040w"))]
+use cyw43_pio::RM2_CLOCK_DIVIDER;
+use cyw43_pio::PioSpi;
 use embassy_executor::Spawner;
 use embassy_net::{Stack, StackResources};
 use embassy_rp::clocks::RoscRng;
