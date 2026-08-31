@@ -69,6 +69,10 @@ required-features = ["badger"]
 name = "chess"
 required-features = ["badger"]
 
+[[example]]
+name = "marquee"
+required-features = ["badger"]
+
 [lints.rust]
 ambiguous_negative_literals = "warn"
 redundant_imports = "warn"

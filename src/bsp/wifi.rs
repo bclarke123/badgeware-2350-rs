@@ -120,7 +120,61 @@ pub async fn connect(
     Err(last_err)
 }
 
+/// Brings the radio up as a (closed) access point host: the driver and a
+/// static-IP stack (192.168.4.1/24) are ready, but no AP is broadcast until
+/// [`Wifi::ap_on`]. For provisioning flows (captive-portal style setup).
+#[expect(clippy::too_many_arguments, reason = "fixed board wiring, called once from main")]
+pub async fn access_point(
+    spawner: Spawner,
+    pio: Peri<'static, PIO0>,
+    irqs: impl Binding<<PIO0 as pio::Instance>::Interrupt, pio::InterruptHandler<PIO0>>,
+    dma: dma::Channel<'static>,
+    pwr: Peri<'static, PIN_23>,
+    dio: Peri<'static, PIN_24>,
+    cs: Peri<'static, PIN_25>,
+    clk: Peri<'static, PIN_29>,
+) -> Wifi {
+    let fw = cyw43::aligned_bytes!("../../firmware/43439A0.bin");
+    let clm = cyw43::aligned_bytes!("../../firmware/43439A0_clm.bin");
+    let nvram = cyw43::aligned_bytes!("../../firmware/nvram_rp2040.bin");
+
+    let pwr = Output::new(pwr, Level::Low);
+    let cs = Output::new(cs, Level::High);
+    let mut pio = Pio::new(pio, irqs);
+    let spi = PioSpi::new(&mut pio.common, pio.sm0, RM2_CLOCK_DIVIDER, pio.irq0, cs, dio, clk, dma);
+
+    let state = STATE.init(State::new());
+    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+    spawner.spawn(cyw43_task(runner).unwrap());
+    control.init(clm).await;
+
+    let config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
+        address: embassy_net::Ipv4Cidr::new(AP_ADDR, 24),
+        gateway: None,
+        dns_servers: heapless::Vec::new(),
+    });
+    let seed = RoscRng.next_u64();
+    let (stack, runner) = embassy_net::new(net_device, config, RESOURCES.init(StackResources::new()), seed);
+    spawner.spawn(net_task(runner).unwrap());
+    Wifi { stack, control }
+}
+
+/// The address the badge uses when hosting an access point.
+pub const AP_ADDR: embassy_net::Ipv4Address = embassy_net::Ipv4Address::new(192, 168, 4, 1);
+
 impl Wifi {
+    /// Starts broadcasting a WPA2 access point (after [`access_point`]).
+    pub async fn ap_on(&mut self, ssid: &str, passphrase: &str, channel: u8) {
+        self.control.start_ap_wpa2(ssid, passphrase, channel).await;
+        log::info!("ap '{}' up on channel {}", ssid, channel);
+    }
+
+    /// Stops broadcasting the access point.
+    pub async fn ap_off(&mut self) {
+        self.control.close_ap().await;
+        log::info!("ap down");
+    }
+
     /// Disassociates from the network (the stack and tasks stay alive); use
     /// [`Wifi::rejoin`] to come back. For apps that idle between bursts of
     /// traffic and want the radio quiet in between.
