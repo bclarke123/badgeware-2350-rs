@@ -54,7 +54,7 @@ use tufty_2350::bsp;
 use tufty_2350::bsp::battery::Battery;
 use tufty_2350::bsp::buttons::{Button, ButtonEvent, ButtonPins, EVENTS};
 use tufty_2350::bsp::epd::{Epd, Speed};
-use tufty_2350::bsp::leds::RearLeds;
+use tufty_2350::bsp::leds::{LedCue, RearLeds};
 use tufty_2350::bsp::rtc::{DateTime, RtcRam};
 use tufty_2350::bsp::screen::{HEIGHT, WIDTH};
 use tufty_2350::bsp::settings::{Settings, MAX_VAL};
@@ -111,7 +111,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(bsp::usb::logger_task_with_input(usb_driver).unwrap());
     log::info!("weather booting");
 
-    let leds = RearLeds::new(p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3);
+    let leds = RearLeds::new(p.PWM_SLICE0, p.PWM_SLICE1, p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3);
     spawner.spawn(bsp::leds::led_task(leds).unwrap());
     let buttons = ButtonPins {
         a: Input::new(p.PIN_7, Pull::Up),
@@ -147,9 +147,10 @@ async fn main(spawner: Spawner) {
     let (ssid, pass) = split_cred(&cred[..cred_len]);
 
     // ---- Radio up + join (one-shot; a failed join means bad credentials —
-    // fall back to setup so the badge never wedges).
-    draw_message(&mut canvas, levels, "Connecting", ssid);
-    epd.present_levels(levels).await;
+    // fall back to setup so the badge never wedges). No status screen: the
+    // panel keeps its last report through power-off, and stale-but-real
+    // info beats "Connecting"; the rear LEDs breathe while we work.
+    bsp::leds::cue(LedCue::Breathe);
     let dma_ch = dma::Channel::new(p.DMA_CH0, Irqs);
     let wifi = match wifi::connect(
         spawner, p.PIO0, Irqs, dma_ch, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, ssid, pass,
@@ -159,6 +160,7 @@ async fn main(spawner: Spawner) {
         Ok(w) => w,
         Err(e) => {
             log::warn!("join failed: {:?}", e);
+            bsp::leds::cue(LedCue::Error);
             draw_message(&mut canvas, levels, "Join failed", "send WIFI <ssid> <pass>, then reboot");
             epd.present_levels(levels).await;
             // Accept new credentials forever; the user reboots after.
@@ -216,6 +218,7 @@ async fn main(spawner: Spawner) {
                 let clock = rtc.read_datetime();
                 let power = (battery.percent(), battery.on_usb());
                 draw_report(&mut canvas, levels, &r, clock.as_ref(), power);
+                bsp::leds::cue(LedCue::Off);
                 epd.present_levels(levels).await;
                 // On battery: arm the next wake and power off entirely.
                 if !battery.on_usb() {
@@ -223,13 +226,16 @@ async fn main(spawner: Spawner) {
                 }
             }
             None => {
-                draw_message(&mut canvas, levels, "Fetch failed", "retrying in a minute");
-                epd.present_levels(levels).await;
+                // Leave the last report up — its "updated" time already
+                // says it is stale. Retry on a short cycle.
+                log::warn!("fetch failed; leaving last report up");
+                bsp::leds::cue(LedCue::Off);
                 if !battery.on_usb() {
                     // Do not burn the battery retrying: sleep a short cycle.
                     sleep_until_next(&mut rtc, 5 * 60);
                 }
                 Timer::after(Duration::from_secs(60)).await;
+                bsp::leds::cue(LedCue::Breathe);
                 continue;
             }
         }

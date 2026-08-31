@@ -107,7 +107,7 @@ async fn main(spawner: Spawner) {
     log::info!("tufty-2350 booting");
 
     // Rear LED zones (GPIO0-3).
-    let leds = RearLeds::new(p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3);
+    let leds = RearLeds::new(p.PWM_SLICE0, p.PWM_SLICE1, p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3);
     spawner.spawn(bsp::leds::led_task(leds).unwrap());
 
     // Front buttons (active low, external pull-ups; internal pulls are harmless).

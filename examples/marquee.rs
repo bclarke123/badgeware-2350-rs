@@ -91,7 +91,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(bsp::usb::logger_task(usb_driver).unwrap());
     log::info!("marquee booting");
 
-    let leds = RearLeds::new(p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3);
+    let leds = RearLeds::new(p.PWM_SLICE0, p.PWM_SLICE1, p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3);
     spawner.spawn(bsp::leds::led_task(leds).unwrap());
     let buttons = ButtonPins {
         a: Input::new(p.PIN_7, Pull::Up),
