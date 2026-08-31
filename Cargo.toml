@@ -38,9 +38,11 @@ sha1 = { version = "0.10", default-features = false }
 cyw43 = "0.7"
 cyw43-pio = "0.10"
 cozy-chess = { version = "0.3", default-features = false }
-reqwless = { version = "0.14", default-features = false, features = ["embedded-tls"] }
+reqwless = { version = "0.14", default-features = false, features = ["embedded-tls", "alloc"] }
 embedded-io-async = "0.7"
 embassy-net = { version = "0.9", features = ["proto-ipv4", "medium-ethernet", "tcp", "udp", "dns", "dhcpv4"] }
+rtt-target = "0.6"
+critical-section = "1"
 
 [features]
 default = ["tufty"]
@@ -75,6 +77,10 @@ required-features = ["badger"]
 
 [[example]]
 name = "marquee"
+required-features = ["badger"]
+
+[[example]]
+name = "reader"
 required-features = ["badger"]
 
 [lints.rust]

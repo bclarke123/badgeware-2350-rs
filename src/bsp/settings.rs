@@ -101,10 +101,13 @@ impl Settings {
         out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
         out[4..8].copy_from_slice(&count.to_le_bytes());
         let end = n.next_multiple_of(4);
+        // The ROM flash helpers reset the QMI's PSRAM window; put it back.
+        let m1 = super::psram::m1_save();
         let ok = self
             .flash
             .blocking_erase(OFFSET, OFFSET + ERASE_SIZE as u32)
             .and_then(|()| self.flash.blocking_write(OFFSET, &out[..end]));
+        super::psram::m1_restore(&m1);
         if let Err(e) = ok {
             log::warn!("settings write failed: {:?}", e);
             return false;

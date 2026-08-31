@@ -18,6 +18,7 @@ pub mod display;
 pub mod epd;
 pub mod leds;
 pub mod power;
+pub mod psram;
 pub mod rtc;
 pub mod settings;
 pub mod screen;
