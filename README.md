@@ -28,6 +28,7 @@ hardware.
 | `weather` | badger | Ambient weather station: joins WiFi, geolocates by IP, fetches Open-Meteo, syncs the RTC from NTP, and refreshes every 15 min with condition icons and a battery gauge. |
 | `chess` | badger | Play White against Stockfish at chess-api.com over TLS 1.3. `cozy-chess` legal moves on five buttons, eval + captured pieces in the panel, game persisted across power-off. |
 | `marquee` | badger | Concert beacon: hold A and the badge becomes a hotspot with a join-QR; your phone's captive-portal sheet pops a form, and the message renders as big as it fits. No app, no shared network, no typed URLs. |
+| `reader` | badger | E-reader: streams a Project Gutenberg book over TLS into the 8 MB PSRAM (progress bar included), then pages it on the e-paper — word wrap, typography cleanup, persistent bookmark, page-up/-down from any point. |
 
 ## Building & flashing (no debug probe needed)
 
@@ -51,7 +52,10 @@ cargo run --release --example weather --no-default-features --features badger # 
 
 Logs: `screen /dev/cu.usbmodem*` (or `tio`); plain-text `log` output over
 USB CDC. Some examples also *read* that port for provisioning (`totp`,
-`weather`).
+`weather`). With a debug probe on the SWD header, the same log also streams
+over RTT — `probe-rs attach --chip RP235x <elf>` — with no USB cable at
+all, and `probe-rs download --chip RP235x <elf>` flashes without touching
+BOOTSEL.
 
 ### Dependency gotcha
 
@@ -182,7 +186,7 @@ this repo's own tiny DHCP/DNS/HTTP servers for phone-based setup.
 | Flash settings store | ✓ (`bsp/settings.rs`) | ✓ (shared keys across apps) |
 | Sleep / power-off | RESET-hold → POWMAN off, buttons wake (`bsp/power.rs`) | ✓ (same) |
 | USB serial log + input | ✓ (`bsp/usb.rs`) | ✓ |
-| PSRAM (8 MB, QMI CS1 = GPIO8) | not yet | not yet |
+| PSRAM (8 MB, QMI CS1 = GPIO8) | wired, untested here | ✓ (`bsp/psram.rs`, memory-mapped) |
 
 ## Roadmap
 
@@ -194,5 +198,3 @@ this repo's own tiny DHCP/DNS/HTTP servers for phone-based setup.
 - 250 MHz overclock (Pimoroni ships the PLL + voltage config) and particles
   to spend the budget.
 - POWMAN wake-render-sleep cycles for months-long battery life on e-paper.
-- RTC alarm wake; PSRAM (both boards carry 8 MB on QMI CS1, but embassy-rp
-  has no driver yet — needs QMI setup ported from pico-sdk).
