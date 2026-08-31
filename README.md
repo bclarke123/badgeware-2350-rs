@@ -1,184 +1,196 @@
-# tufty-2350
+# badgeware-2350-rs
 
-Rust/[Embassy](https://embassy.dev) firmware for the [Pimoroni Tufty 2350](https://github.com/pimoroni/tufty2350)
-badge: a procedurally grown 3D tree garden on a dual-core software renderer
-and a custom PIO+DMA display driver. No MicroPython, no interpreter, no heap —
-a single static binary straight on the metal. (A Simon-style memory game lived
-here previously — see git history.)
+Rust/[Embassy](https://embassy.dev) firmware for [Pimoroni's Badgeware](https://shop.pimoroni.com/collections/badgeware)
+family of RP2350 badges — no MicroPython, no interpreter, no heap; single
+static binaries straight on the metal.
 
-Left alone it is a desk sculpture: every minute the current tree eases back
-into the ground and a new random seed grows in its place — three species
-(pink-blossom sakura, classic green, dense low bush), each deterministic per
-seed, with recursive ribbon branches, billboard leaves, wind sway, and
-staggered cubic-eased growth from bare trunk to full bloom. Around it: a
-gently bumpy meadow, a ten-minute day cycle (dusk → orange sunset → starry
-purple night → pink dawn, Bayer-dithered gradients), twinkling stars that only
-come out after dark, and distant flapping bird silhouettes that cross the sky
-by day, over a perspective-textured meadow that fogs into the horizon.
-Dense scenes run ~1,700–1,900 triangles at a vsync-locked 60 fps on
-the stock 150 MHz clock (re-measure after the sprite/AA renderer: see the
-`frame:` lines on the serial log: `vsync` is idle wait, `dma` the transfer
-time left after geometry, and the `core0:` split is the left half's raster).
+| Board | Screen | Status |
+|---|---|---|
+| [Tufty 2350](https://github.com/pimoroni/tufty2350) | 2.8" 320×240 ST7789 LCD, 8-bit parallel | supported (`--features tufty`, default) |
+| [Badger 2350](https://github.com/pimoroni/badger2350) | 2.7" 264×176 SSD1680 four-grey e-paper | supported (`--features badger`) |
+| Blinky 2350 | 39×26 white LED matrix | in the post |
 
-**Controls**: A = plant a new random seed, B = replay the current tree's
-growth, C = pause/resume the orbit, UP/DOWN = zoom, HOME-hold ~2 s = reboot to
-BOOTSEL, RESET-hold ~1.5 s = sleep (any front button wakes). Frame timings and
-seeds are logged over USB serial.
+One library crate (`bsp` drivers, `gfx` greyscale pipeline, `render3d`
+software renderer, `flora` scene, `boot` plumbing); every app is a binary in
+`examples/`. The boards share their buttons, rear LEDs, RTC, RM2 radio and
+power path, so most examples are a feature flag away from each other's
+hardware.
 
-## 3D renderer (`src/render3d`)
+## Examples
 
-Painter's algorithm, near-plane clipping, colors baked at generation time.
-Two primitive kinds: flat-shaded triangles with **anti-aliased silhouette
-edges**, and **textured billboard sprites** (every leaf and blossom) sampled
-by the RP2350's SIO interpolators. Every frame runs **two fork-joins across
-both cores**, with the panel DMA hidden behind the first:
-
-1. **Present + geometry**: core 0 waits for vblank (TE) and starts the ~7 ms
-   DMA of the *previous* frame (22 Mbyte/s parallel bus). While it streams,
-   core 1 emits the odd half of the tree into its own primitive list and
-   core 0 does the even half plus scenery (terrain, stars, birds) into a
-   second list; each list is radix-sorted by depth (packed `depth<<16|index`
-   keys — sorting 4-byte keys, not 32-byte entries, is what keeps the sort
-   out of the budget). Geometry never touches the framebuffer, so it costs
-   nothing on the critical path.
-2. **Raster**: each core clears and draws one part of the framebuffer,
-   merge-walking the two sorted lists (one compare per primitive — no copy,
-   no re-sort). The column-major framebuffer makes the parts contiguous
-   disjoint slices. The DMA streams columns left to right, so core 1 takes
-   the *left* part and starts the moment the DMA's `READ_ADDR` has passed it
-   (~4 ms before the transfer ends), while core 0 takes the right part after
-   the transfer completes. The split column is re-balanced every frame from
-   the two cores' finish times (screen columns are not work: the tree is
-   centred, and its footprint moves with the orbit), and each core skips
-   primitives whose x extent misses its part before any setup.
-
-The DMA is ~8 ms of the 16.7 ms frame (150 KB at 37.5 MHz / 2 cycles per
-byte), so this staggering is what keeps a dense bush at 60 fps. The
-rasterizer is linked into RAM: both cores execute it concurrently and the
-XIP flash cache is shared.
-
-Core 1 runs a bare loop (no executor, no clock access) fed jobs through an
-`embassy-sync` Signal handshake; a HardFault handler and a join watchdog turn
-any wedge into a reflashable BOOTSEL reboot instead of a freeze. The
-rasterizer walks triangles column-by-column (f32 setup, 16.16 fixed per-column
-increments) so the hot loop is a sequential byte fill. Trig and square roots
-are fast f32 approximations — `libm`'s f64-internal `sinf` costs microseconds
-per call on the M33's single-precision FPU (measured as a 20x geometry
-slowdown before replacement).
-
-**Edge anti-aliasing** costs almost nothing because the coverage is already
-there: the fractional bits of each column run's 16.16 end positions are the
-exact vertical coverage of its first and last pixel, so those two pixels are
-alpha-blended (5-bit alpha, one-multiply RGB565 lerp) over whatever the
-painter's order already put there. Only silhouette edges blend — each
-triangle carries a 3-bit mask, and an edge shared with a neighbour (a
-ribbon's diagonal, every terrain grid line) uses the exact pixel-center
-ownership rule instead, so seams stay seamless rather than leaking a
-hairline of sky. Coverage is resolved along y only: shallow edges (the ones
-that shimmer under wind sway) go smooth, steep edges keep their stairs.
-
-**Ground.** The meadow's 98 triangles are perspective-correct textured:
-`u/z`, `v/z`, `1/z` are affine in screen space, so each column is walked in
-8-pixel chunks with one reciprocal per chunk and the interpolator stepping
-u/v inside it. Texture coordinates are world x/z, so the grass is nailed to
-the ground as the camera orbits. The tile is a boot-time procedural shade
-map (3-octave tiling value noise quantized to 8 levels plus blade flecks,
-64 texels per unit, box-averaged mips picked per triangle by depth), tinted
-per triangle from the cell mottle and fogged toward the sky's horizon colour
-with distance.
-
-**Sprites and the SIO interpolator.** Leaves, tufts and blossoms are one
-screen-aligned textured quad each (2 triangles; blossoms used to be 4 flat
-ones). Textures are *shade maps*, not images — 0 transparent, 1 half-covered
-edge, 2–4 dark/mid/light — baked at boot by supersampling analytic shapes
-into 16×16 maps plus 8×8 mips (`src/render3d/texture.rs`); the rasterizer
-turns levels into RGB565 from each triangle's own base tint, so one map
-serves every green and every pink. Affine u/v stepping per pixel is
-"add, shift, mask, combine into an address", which is exactly what the
-per-core `INTERP0` does in hardware: lane 0 accumulates u, lane 1 v, and one
-`POP_FULL` read returns the texel address while auto-advancing both. The
-lane masks also wrap out-of-range coordinates into the map's transparent
-border, so quad-edge rounding slop can never show a stray texel.
-
-## Badger 2350 (e-paper)
-
-The same library targets the Badger 2350 (`--no-default-features --features
-badger`): RP2350A, 2.7" 264×176 SSD1680 four-grey e-paper on SPI0
-(`src/bsp/epd.rs`, Pimoroni's waveform LUT ported verbatim; full refresh
-measured at 1.14 s TURBO to 3.67 s SLOW, four clean greys, no visible
-ghosting). Buttons, LEDs, RTC and the POWMAN sleep path are pin-identical to
-the Tufty.
-
-Greyscale rendering goes through `gfx::grey` (an 8-bit `embedded-graphics`
-canvas, with a 2× supersampling resolve) and `gfx::dither` (linear-light
-quantization against the panel's calibrated reflectances — its level 1 is
-nearly black, ~10%, and level 2 ~51% — with Bayer 4×4/8×8, Floyd–Steinberg
-and nearest, selectable per rectangle). `examples/epd_test.rs` is the test
-card used to judge all of this on the panel: flat levels and ramps, the three
-dithers, 1:1 vs supersampled text, and a shaded sphere; A/B refresh at
-TURBO/SLOW and C/UP/DOWN adjust the calibration live. The tree garden also
-runs on it (`--example tree`), though it was designed for a backlit screen.
-
-## Hardware covered
-
-| Subsystem | Support |
-|---|---|
-| RP2350B @ 150 MHz, both cores + FPUs | `embassy-rp` (`rp235xb`) |
-| 2.8" 320×240 ST7789, 8-bit 8080 parallel bus | custom PIO+DMA driver (`src/bsp/display.rs`) |
-| 5 front buttons + HOME | debounced event channel (`src/bsp/buttons.rs`) |
-| Backlight (PWM) + phototransistor | auto-brightness (`src/bsp/backlight.rs`) |
-| 4-zone rear LEDs | cue patterns (`src/bsp/leds.rs`) |
-| USB serial logging | `embassy-usb-logger` (`src/bsp/usb.rs`) |
-| Dual-core rendering | core 1 geometry + raster coprocessor (`src/render3d/core1.rs`) |
-| Sleep / power-off | hold RESET ~1.5 s → POWMAN off, any front button wakes (`src/bsp/power.rs`) |
-| PCF85063A RTC | dormant driver (`src/bsp/rtc.rs`; held the Simon high score in its one battery-backed RAM byte, now awaiting timekeeping/alarm duty) |
-| WiFi/BT (RM2), battery gauge, PSRAM | not yet (see roadmap) |
+| Example | Board | What it does |
+|---|---|---|
+| `tree` | both | Procedurally grown 3D tree garden: dual-core renderer, anti-aliased edges, SIO-interpolator textured sprites, perspective grass, day cycle. 60 fps on the Tufty. |
+| `epd_test` | badger | E-paper test card: the four panel greys, dither comparisons (Bayer 4×4/8×8, Floyd–Steinberg), supersampled text, live calibration on the buttons. |
+| `badge` | badger | Name badge driven by `examples/badge.vcf`: big name, social handles parsed from URLs (`GH: you`, `LI: you`), and a scannable vCard QR. |
+| `totp` | badger | Six-digit authenticator: battery-backed RTC, secret in flash, provisioning over USB serial, seven-segment digits with a draining 30 s bar. |
+| `weather` | badger | Ambient weather station: joins WiFi, geolocates by IP, fetches Open-Meteo, syncs the RTC from NTP, and refreshes every 15 min with condition icons and a battery gauge. |
+| `chess` | badger | Play White against Stockfish at chess-api.com over TLS 1.3. `cozy-chess` legal moves on five buttons, eval + captured pieces in the panel, game persisted across power-off. |
+| `marquee` | badger | Concert beacon: hold A and the badge becomes a hotspot with a join-QR; your phone's captive-portal sheet pops a form, and the message renders as big as it fits. No app, no shared network, no typed URLs. |
 
 ## Building & flashing (no debug probe needed)
 
 Prerequisites: Rust stable with the `thumbv8m.main-none-eabihf` target
 (`rust-toolchain.toml` installs it) and `picotool` (`brew install picotool`).
 
-The crate is a library plus binaries in `examples/`; the board is a Cargo
-feature (`tufty`, default, or `badger`):
-
 ```sh
-cargo run --release --example tree                                        # Tufty 2350
-cargo run --release --example tree --no-default-features --features badger # Badger 2350
+cargo run --release --example tree                                            # Tufty
+cargo run --release --example weather --no-default-features --features badger # Badger
 ```
 
 1. **First flash:** hold the BOOT button while plugging in USB — the badge
-   mounts as `RP2350` bootloader — then run the command above. (On a Badger
-   still running BadgeOS, `import machine; machine.bootloader()` at its
-   MicroPython REPL does the same; our firmware replaces BadgeOS, which is
-   restored by flashing Pimoroni's release `.uf2`.)
-
+   mounts as the `RP2350` bootloader — then run the command above. (On a
+   Badger still running BadgeOS, `import machine; machine.bootloader()` at
+   its MicroPython REPL does the same; this firmware replaces BadgeOS, which
+   is restored by flashing Pimoroni's release `.uf2`.)
 2. **Every flash after that:** hold **HOME for 2 seconds** on the running
-   firmware to reboot into BOOTSEL, then run the command again.
-   Panics and hard faults also drop the badge back into BOOTSEL, so it can
-   always be reflashed.
+   firmware to reboot into BOOTSEL, then run the command again. Panics and
+   hard faults also end in BOOTSEL (after a ~5 s pause), so a badge is never
+   bricked — if one seems dead, it may just be waiting in the bootloader.
 
-Logs: `screen /dev/cu.usbmodem*` (or `tio`); plain-text `log` output over USB CDC.
+Logs: `screen /dev/cu.usbmodem*` (or `tio`); plain-text `log` output over
+USB CDC. Some examples also *read* that port for provisioning (`totp`,
+`weather`).
 
-## Display driver notes
+### Dependency gotcha
 
-The ST7789 is wired over an 8-bit parallel bus (DB0–7 = GPIO32–39, WR = 30,
-DC = 28, CS = 27, RD = 31 held high, backlight = 26, TE/vsync = 21). A
-two-instruction PIO program (`out pins,8 side 0` / `nop side 1`) strobes WR
-while DMA feeds bytes; a full 150 KiB frame presents in ~8 ms. Init sequence
-and bus timing follow Pimoroni's official C driver (`modules/c/st7789` in the
-tufty2350 repo).
+`embedded-tls` (behind `reqwless`, for the chess example) pins RustCrypto's
+`der`/`der_derive` at pre-release versions that cargo's resolver will happily
+"upgrade" into a broken build. The working versions are captured in
+`Cargo.lock`; after any `cargo update`, restore them with:
 
-Tear-free presents: the framebuffer is stored in panel scan order (the panel
-refreshes as 240×320 portrait; `src/gfx` pays the transpose in per-pixel index
-math, keeping fills contiguous), and `present` waits for the TE vblank pulse
-before streaming. The ~8 ms write starts ahead of the ~17 ms refresh beam and
-outruns it, so the beam never crosses the write.
+```sh
+cargo update -p der --precise 0.8.0-rc.10
+cargo update -p der_derive --precise 0.8.0-rc.6
+```
+
+## Framework tour
+
+- **`bsp`** — per-subsystem drivers: `display` (Tufty PIO+DMA LCD), `epd`
+  (Badger SSD1680 incl. partial-window refresh), `buttons` (debounced
+  events), `leds` (cue patterns), `backlight` (Tufty auto-brightness),
+  `rtc` (PCF85063A timekeeping + lost-power flag), `battery` (calibrated
+  voltage, LiPo percent, USB detect), `settings` (key-value store in the
+  last flash sector — shared by all apps, survives reflashing), `usb`
+  (logging + line input), `power` (POWMAN off, button/RTC wake), and
+  `wifi` — station mode with bounded join/DHCP retries and an idle
+  leave/rejoin lifecycle, plus access-point hosting for captive-portal
+  provisioning (see `marquee`: one-lease DHCP server, wildcard DNS, and the
+  HTTP form the phone auto-opens as its "sign in" page).
+- **`gfx`** — `FrameBuffer` (RGB565, column-major, DMA-ready), `grey` (8-bit
+  canvas with `embedded-graphics` support and 2× supersampling resolve),
+  `dither` (linear-light quantization to the e-paper's *measured* grey
+  levels; Bayer 4×4/8×8, Floyd–Steinberg, nearest — selectable per
+  rectangle), `widgets` (battery gauge).
+- **`render3d`** — the dual-core software renderer (below).
+- **`boot`** — RP2350 image definition, picotool metadata, and the
+  panic/HardFault→BOOTSEL strategy, linked into every binary.
+
+Fonts come from [`u8g2-fonts`](https://crates.io/crates/u8g2-fonts) (crox,
+logisoso, seven-segment, chess glyphs, Open Iconic weather icons); QR codes
+from `qrcodegen-no-heap`. Radio firmware blobs are vendored in `firmware/`
+under their permissive binary license.
+
+## The Tufty renderer (`src/render3d`)
+
+A dual-core painter's-algorithm renderer: flat-shaded triangles with
+**anti-aliased silhouette edges**, plus **textured billboard sprites**
+sampled by the RP2350's SIO interpolators. Every frame runs two fork-joins,
+with the panel DMA hidden behind the first:
+
+1. **Present + geometry**: core 0 waits for vblank (TE) and starts the ~8 ms
+   DMA of the *previous* frame. While it streams, both cores emit and
+   radix-sort their halves of the scene (packed `depth<<16|index` keys —
+   sorting 4-byte keys, not 32-byte entries, keeps the sort out of the
+   budget). Geometry never touches the framebuffer, so it is free on the
+   critical path.
+2. **Raster**: the DMA streams columns left to right, so core 1 takes the
+   *left* part of the frame and starts the moment the DMA's `READ_ADDR` has
+   passed it (~4 ms before the transfer ends); core 0 takes the right part
+   after the transfer completes. The split column re-balances every frame
+   from the cores' finish times, and each core pre-rejects primitives whose
+   x-extent misses its part.
+
+Details that matter:
+
+- **Edge AA for almost nothing**: the fractional bits of each column run's
+  16.16 end positions *are* the pixel coverage; those two pixels alpha-blend
+  (5-bit alpha, one-multiply RGB565 lerp). A 3-bit per-triangle mask keeps
+  shared edges on the exact pixel-center rule so seams never leak sky.
+- **Sprites via `INTERP0`**: leaves and blossoms are single textured
+  parallelograms; per-pixel u/v stepping is one `POP_FULL` read (the lane
+  masks even wrap rounding slop into the map's transparent border). Textures
+  are boot-baked *shade maps* tinted per sprite, so one 16×16 map (plus an
+  8×8 mip) serves every green and every pink.
+- **Perspective-correct grass**: `u/z, v/z, 1/z` are affine in screen space;
+  columns walk in 8-pixel chunks with one reciprocal per chunk and the
+  interpolator stepping inside. World-space UVs nail the texture to the
+  ground under the orbiting camera; procedural noise tile, depth-picked
+  mips, distance fog to the horizon colour.
+- **Hot code lives in RAM** (`.data`): both cores share one XIP flash cache,
+  and RAM placement of the raster + geometry paths bought milliseconds.
+- Fast f32 trig/rsqrt everywhere — `libm`'s f64-internal `sinf` was a
+  measured 20× geometry slowdown on the M33's single-precision FPU.
+
+The scene (`src/flora`) grows three deterministic-per-seed species with wind
+sway and staggered growth, over a bumpy meadow, a ten-minute day cycle,
+stars, and birds. Tufty controls: A = new seed, B = replay growth,
+C = pause orbit, UP/DOWN = zoom. Frame timings stream over serial.
+
+### Tufty display notes
+
+The ST7789 rides an 8-bit parallel bus (DB0–7 = GPIO32–39, WR = 30 strobed
+by a two-instruction PIO program, DC = 28, CS = 27, TE/vsync = 21); DMA
+feeds the PIO and a full 150 KiB frame streams in ~8 ms. The framebuffer is
+stored in panel scan order (portrait, column-major — `src/gfx` pays the
+transpose per pixel write), and presents wait for the TE pulse so the write
+outruns the refresh beam: tear-free without double buffering.
+
+## The Badger pipeline
+
+The SSD1680 driver ports Pimoroni's four-grey waveform verbatim; full
+refreshes measure 1.14 s (TURBO) to 3.67 s (SLOW), with clean greys at every
+tier and no visible ghosting. A partial-window mode can re-scan just a band
+of columns, but every partial pass slightly fades the undriven rest of the
+panel — after measuring twice, the house style is full TURBO refreshes, with
+partials reserved for content that truly needs flicker-free updates.
+
+Greyscale rendering is calibrated to the panel's *actual* reflectances
+(level 1 is nearly black at ~10%, level 2 ~51% — assume even spacing and
+everything drowns in black), quantized in linear light, with the dither
+method selectable per region: ordered for stability, error-diffusion for
+photographic content, nearest for text and QR codes. `epd_test` puts all of
+it on the panel side by side, with live calibration on the buttons.
+
+Networking runs the RM2 (CYW43439) over PIO SPI — the same wiring as a
+Pico W — through `cyw43` + `embassy-net`: station mode with DHCP, DNS, TCP,
+UDP, and TLS 1.3 via `reqwless`/`embedded-tls`; or access-point mode with
+this repo's own tiny DHCP/DNS/HTTP servers for phone-based setup.
+
+## Hardware covered
+
+| Subsystem | Tufty | Badger |
+|---|---|---|
+| MCU | RP2350B @ 150 MHz, both cores + FPUs | RP2350A @ 150 MHz |
+| Screen | ST7789 LCD, PIO+DMA, TE-synced (`bsp/display.rs`) | SSD1680 e-paper, 4 grey (`bsp/epd.rs`) |
+| Buttons / rear LEDs | ✓ (`bsp/buttons.rs`, `bsp/leds.rs`) | ✓ (same pins) |
+| Backlight + light sensor | ✓ (`bsp/backlight.rs`) | n/a |
+| WiFi/BT (RM2 / CYW43439) | wired, untested here | ✓ STA + AP (`bsp/wifi.rs`) |
+| RTC (PCF85063A) | ✓ (`bsp/rtc.rs`) | ✓ + NTP sync via `weather` |
+| Battery gauge | pending (ADC shared with light sensor) | ✓ (`bsp/battery.rs`) |
+| Flash settings store | ✓ (`bsp/settings.rs`) | ✓ (shared keys across apps) |
+| Sleep / power-off | RESET-hold → POWMAN off, buttons wake (`bsp/power.rs`) | ✓ (same) |
+| USB serial log + input | ✓ (`bsp/usb.rs`) | ✓ |
+| PSRAM | n/a | not yet |
 
 ## Roadmap
 
-- 250 MHz overclock (Pimoroni ships the PLL + voltage config for this board)
-  and falling leaves/petals to spend the new budget.
-- WiFi/BT via `cyw43` (RM2 module: WL_ON=23, DATA=24, CS=25, CLK=29).
-- RTC timekeeping + alarm sleep/wake (`src/bsp/rtc.rs` is wired and waiting).
-- Battery gauge (VBAT_SENSE=40, VBUS_DETECT=12).
+- **Blinky 2350 bring-up**: matrix driver, scrolling marquee port (same
+  captive-portal plumbing, open-AP short-SSID join QR, instant display
+  toggle on B), greyscale-glow demos.
+- Crate rename to match the repo (the library is still `tufty_2350` in
+  code).
+- 250 MHz overclock (Pimoroni ships the PLL + voltage config) and particles
+  to spend the budget.
+- POWMAN wake-render-sleep cycles for months-long battery life on e-paper.
+- RTC alarm wake, PSRAM.
