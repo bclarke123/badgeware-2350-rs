@@ -21,8 +21,15 @@ const RTC_ADDR: u8 = 0x51;
 /// Register address of the free `RAM_byte`.
 const REG_RAM_BYTE: u8 = 0x03;
 
+/// Control_2: bit 7 = alarm interrupt enable (AIE), bit 6 = alarm flag (AF).
+const REG_CONTROL_2: u8 = 0x01;
+
 /// First time register (seconds; bit 7 is the oscillator-stop "OS" flag).
 const REG_SECONDS: u8 = 0x04;
+
+/// First alarm register (second, minute, hour, day, weekday; a field with
+/// bit 7 set does not participate in the match).
+const REG_SECOND_ALARM: u8 = 0x0B;
 
 /// A calendar timestamp as the RTC stores it (no timezone; store UTC).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +43,37 @@ pub struct DateTime {
 }
 
 impl DateTime {
+    /// The calendar time for a Unix timestamp (valid 2000..=2099).
+    pub fn from_unix(unix: u64) -> Self {
+        let days = unix / 86400;
+        let secs = unix % 86400;
+        let mut year = 1970u64;
+        let mut remaining = days;
+        loop {
+            let len = if year.is_multiple_of(4) { 366 } else { 365 };
+            if remaining < len {
+                break;
+            }
+            remaining -= len;
+            year += 1;
+        }
+        let leap = year.is_multiple_of(4);
+        let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let mut month = 0usize;
+        while remaining >= months[month] {
+            remaining -= months[month];
+            month += 1;
+        }
+        Self {
+            year: year as u16,
+            month: month as u8 + 1,
+            day: remaining as u8 + 1,
+            hour: (secs / 3600) as u8,
+            minute: (secs / 60 % 60) as u8,
+            second: (secs % 60) as u8,
+        }
+    }
+
     /// Seconds since the Unix epoch (valid for 2000..=2099, the RTC's range).
     pub fn unix(&self) -> u64 {
         // Days since 1970-01-01 via the civil-from-days inverse (Howard
@@ -130,6 +168,36 @@ impl RtcRam {
             month: from_bcd(buf[5] & 0x1f),
             year: 2000 + u16::from(from_bcd(buf[6])),
         })
+    }
+
+    /// Arms the alarm interrupt `seconds` from now: the INT pin (RTC_ALARM,
+    /// GPIO13 on both boards) goes low at the match — the POWMAN wake source
+    /// [`crate::bsp::power`] arms. The pin stays low until
+    /// [`RtcRam::clear_alarm`] runs, so clear at boot before sleeping again.
+    pub fn set_alarm_in(&mut self, seconds: u32) -> bool {
+        let Some(now) = self.read_datetime() else { return false };
+        let target = DateTime::from_unix(now.unix() + u64::from(seconds));
+        let regs = [
+            REG_SECOND_ALARM,
+            to_bcd(target.second),
+            to_bcd(target.minute),
+            to_bcd(target.hour),
+            to_bcd(target.day),
+            0x80, // weekday: not matched
+        ];
+        if self.i2c.write(RTC_ADDR, &regs).is_err() {
+            return false;
+        }
+        // Clear the alarm flag and enable the interrupt (AF=0, AIE=1).
+        self.i2c.write(RTC_ADDR, &[REG_CONTROL_2, 0x80]).is_ok()
+    }
+
+    /// Clears a fired alarm (releases the INT line) and disables the
+    /// interrupt. Call at boot on wake.
+    pub fn clear_alarm(&mut self) {
+        let _ = self.i2c.write(RTC_ADDR, &[REG_CONTROL_2, 0x00]);
+        let dummy = [REG_SECOND_ALARM, 0x80, 0x80, 0x80, 0x80, 0x80];
+        let _ = self.i2c.write(RTC_ADDR, &dummy);
     }
 
     /// Sets the clock (also clears the OS "lost power" flag, which lives in

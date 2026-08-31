@@ -17,6 +17,14 @@
 //! example uses. Plain HTTP only (ip-api.com and api.open-meteo.com both
 //! serve it), so no TLS stack is needed.
 //!
+//! **Power**: on USB it stays awake and refreshes every 15 minutes. On
+//! battery it becomes a wake-render-sleep cycle: after each report it arms
+//! the RTC alarm and powers off through POWMAN (~2% duty instead of a
+//! permanently associated radio — weeks per charge, and the e-paper keeps
+//! the last report). Any front button wakes it for an immediate fetch. The
+//! geolocation is cached in the settings sector so each wake costs one
+//! request less.
+//!
 //! **A** fetches now; **B** re-enters WiFi setup. HOME held 2 s reboots to
 //! BOOTSEL.
 
@@ -120,6 +128,9 @@ async fn main(spawner: Spawner) {
     epd.set_speed(Speed::Slow);
 
     let mut rtc = RtcRam::new(p.I2C0, p.PIN_5, p.PIN_4);
+    // A fired alarm holds the INT line low; release it before anything else
+    // (the POWMAN wake path needs the line high to re-arm).
+    rtc.clear_alarm();
     let mut settings = Settings::new(p.FLASH);
     let mut battery = Battery::new(p.ADC, p.PIN_26, p.PIN_28, p.PIN_12);
 
@@ -159,7 +170,24 @@ async fn main(spawner: Spawner) {
     let stack = wifi.stack;
 
     // ---- Fetch/display loop.
+    // Geolocation: cached across wake cycles as "lat lon offset city".
     let mut geo: Option<(f32, f32, i32, heapless::String<24>)> = None;
+    {
+        let mut buf = [0u8; MAX_VAL];
+        if let Some(cached) = settings.get("geo", &mut buf).and_then(|b| core::str::from_utf8(b).ok()) {
+            let mut it = cached.splitn(4, ' ');
+            if let (Some(lat), Some(lon), Some(off), Some(city)) =
+                (it.next(), it.next(), it.next(), it.next())
+            {
+                if let (Ok(lat), Ok(lon), Ok(off)) = (lat.parse(), lon.parse(), off.parse()) {
+                    let mut c = heapless::String::new();
+                    let _ = c.push_str(city);
+                    log::info!("geo from cache: {}", city);
+                    geo = Some((lat, lon, off, c));
+                }
+            }
+        }
+    }
     loop {
         // NTP first (also provisions the RTC for other apps).
         if let Some(unix) = sntp(stack).await {
@@ -167,6 +195,11 @@ async fn main(spawner: Spawner) {
         }
         if geo.is_none() {
             geo = geolocate(stack, response).await;
+            if let Some((lat, lon, off, city)) = &geo {
+                let mut blob = heapless::String::<64>::new();
+                let _ = write!(blob, "{:.4} {:.4} {} {}", lat, lon, off, city);
+                let _ = settings.set("geo", blob.as_bytes());
+            }
         }
         let report = match &geo {
             Some((lat, lon, offset, city)) => {
@@ -184,10 +217,18 @@ async fn main(spawner: Spawner) {
                 let power = (battery.percent(), battery.on_usb());
                 draw_report(&mut canvas, levels, &r, clock.as_ref(), power);
                 epd.present_levels(levels).await;
+                // On battery: arm the next wake and power off entirely.
+                if !battery.on_usb() {
+                    sleep_until_next(&mut rtc, REFRESH.as_secs() as u32);
+                }
             }
             None => {
                 draw_message(&mut canvas, levels, "Fetch failed", "retrying in a minute");
                 epd.present_levels(levels).await;
+                if !battery.on_usb() {
+                    // Do not burn the battery retrying: sleep a short cycle.
+                    sleep_until_next(&mut rtc, 5 * 60);
+                }
                 Timer::after(Duration::from_secs(60)).await;
                 continue;
             }
@@ -203,6 +244,16 @@ async fn main(spawner: Spawner) {
             wifi_setup(&mut epd, &mut canvas, levels, &mut settings, &mut cred).await;
         }
     }
+}
+
+/// Arms the RTC alarm `seconds` out and powers off (POWMAN). Wakes on the
+/// alarm or any front button; never returns on success.
+fn sleep_until_next(rtc: &mut RtcRam, seconds: u32) {
+    if rtc.set_alarm_in(seconds) {
+        log::info!("sleeping {} s (alarm + buttons wake)", seconds);
+        bsp::power::power_off();
+    }
+    log::warn!("could not arm RTC alarm; staying awake");
 }
 
 /// Splits the stored `ssid\0pass` credential blob.
@@ -294,36 +345,17 @@ async fn sntp(stack: embassy_net::Stack<'static>) -> Option<u64> {
 
 /// Writes a Unix timestamp into the RTC as UTC.
 fn set_rtc_from_unix(rtc: &mut RtcRam, unix: u64) {
-    // Days-to-civil for 2000..2099 (every 4th year leap).
-    let days = unix / 86400;
-    let secs = unix % 86400;
-    let mut year = 1970;
-    let mut remaining = days;
-    loop {
-        let len = if year % 4 == 0 { 366 } else { 365 };
-        if remaining < len {
-            break;
-        }
-        remaining -= len;
-        year += 1;
-    }
-    let leap = year % 4 == 0;
-    let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut month = 0;
-    while remaining >= months[month] {
-        remaining -= months[month];
-        month += 1;
-    }
-    let dt = DateTime {
-        year: year as u16,
-        month: month as u8 + 1,
-        day: remaining as u8 + 1,
-        hour: (secs / 3600) as u8,
-        minute: (secs / 60 % 60) as u8,
-        second: (secs % 60) as u8,
-    };
+    let dt = DateTime::from_unix(unix);
     if rtc.set_datetime(&dt) {
-        log::info!("rtc set from ntp: {:04}-{:02}-{:02} {:02}:{:02}:{:02}Z", dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
+        log::info!(
+            "rtc set from ntp: {:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+            dt.year,
+            dt.month,
+            dt.day,
+            dt.hour,
+            dt.minute,
+            dt.second
+        );
     }
 }
 

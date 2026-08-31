@@ -182,7 +182,7 @@ this repo's own tiny DHCP/DNS/HTTP servers for phone-based setup.
 | Flash settings store | ✓ (`bsp/settings.rs`) | ✓ (shared keys across apps) |
 | Sleep / power-off | RESET-hold → POWMAN off, buttons wake (`bsp/power.rs`) | ✓ (same) |
 | USB serial log + input | ✓ (`bsp/usb.rs`) | ✓ |
-| PSRAM | n/a | not yet |
+| PSRAM (8 MB, QMI CS1 = GPIO8) | not yet | not yet |
 
 ## Roadmap
 
@@ -194,4 +194,5 @@ this repo's own tiny DHCP/DNS/HTTP servers for phone-based setup.
 - 250 MHz overclock (Pimoroni ships the PLL + voltage config) and particles
   to spend the budget.
 - POWMAN wake-render-sleep cycles for months-long battery life on e-paper.
-- RTC alarm wake, PSRAM.
+- RTC alarm wake; PSRAM (both boards carry 8 MB on QMI CS1, but embassy-rp
+  has no driver yet — needs QMI setup ported from pico-sdk).
