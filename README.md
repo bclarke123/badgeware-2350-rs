@@ -20,6 +20,7 @@ hardware.
 
 | Example | Board | What it does |
 |---|---|---|
+| `simon` | tufty | The repo's original app: a Simon memory game on the five buttons — animated pads aligned with the physical controls, LED echoes, high score in the RTC's battery-backed byte. |
 | `tree` | both | Procedurally grown 3D tree garden: dual-core renderer, anti-aliased edges, SIO-interpolator textured sprites, perspective grass, day cycle. 60 fps on the Tufty. |
 | `epd_test` | badger | E-paper test card: the four panel greys, dither comparisons (Bayer 4×4/8×8, Floyd–Steinberg), supersampled text, live calibration on the buttons. |
 | `badge` | badger | Name badge driven by `examples/badge.vcf`: big name, social handles parsed from URLs (`GH: you`, `LI: you`), and a scannable vCard QR. |

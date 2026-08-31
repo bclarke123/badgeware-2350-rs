@@ -50,6 +50,10 @@ tufty = ["embassy-rp/rp235xb"]
 badger = ["embassy-rp/rp235xa"]
 
 [[example]]
+name = "simon"
+required-features = ["tufty"]
+
+[[example]]
 name = "epd_test"
 required-features = ["badger"]
 
