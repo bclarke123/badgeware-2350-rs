@@ -53,7 +53,10 @@ use u8g2_fonts::{fonts, FontRenderer};
 use tufty_2350::bsp;
 use tufty_2350::bsp::battery::Battery;
 use tufty_2350::bsp::buttons::{Button, ButtonEvent, ButtonPins, EVENTS};
+#[cfg(feature = "badger")]
 use tufty_2350::bsp::epd::{Epd, Speed};
+#[cfg(feature = "badger2040w")]
+use tufty_2350::bsp::epd_mono::{Epd, Speed};
 use tufty_2350::bsp::leds::{LedCue, RearLeds};
 use tufty_2350::bsp::rtc::{DateTime, RtcRam};
 use tufty_2350::bsp::screen::{HEIGHT, WIDTH};
@@ -79,6 +82,63 @@ const BLACK: Gray8 = Gray8::new(0);
 /// Fetch cadence.
 const REFRESH: Duration = Duration::from_secs(15 * 60);
 
+// Layout metrics: the same five-row card on both panels — city, big
+// temperature, condition, rule, stats + footer — with the baselines and
+// type sizes chosen per panel height (176 px vs 128 px).
+#[cfg(feature = "badger")]
+mod layout {
+    pub const TITLE_Y: i32 = 30;
+    pub const TEMP_Y: i32 = 92;
+    pub const COND_Y: i32 = 128;
+    pub const RULE_Y: i32 = 140;
+    pub const STATS_Y: i32 = 158;
+    pub const FOOT_Y: i32 = 172;
+    pub const ICON_CY: i32 = 72;
+    pub const SNOW_DY: i32 = 44;
+    pub const MSG_HEAD_Y: i32 = 80;
+    pub const MSG_DETAIL_Y: i32 = 104;
+}
+#[cfg(feature = "badger2040w")]
+mod layout {
+    pub const TITLE_Y: i32 = 16;
+    pub const TEMP_Y: i32 = 62;
+    pub const COND_Y: i32 = 84;
+    pub const RULE_Y: i32 = 94;
+    pub const STATS_Y: i32 = 110;
+    pub const FOOT_Y: i32 = 124;
+    pub const ICON_CY: i32 = 46;
+    pub const SNOW_DY: i32 = 36;
+    pub const MSG_HEAD_Y: i32 = 56;
+    pub const MSG_DETAIL_Y: i32 = 80;
+}
+use layout::*;
+
+/// The big temperature face, sized per panel.
+fn font_big() -> FontRenderer {
+    #[cfg(feature = "badger")]
+    return FontRenderer::new::<fonts::u8g2_font_logisoso42_tf>();
+    #[cfg(feature = "badger2040w")]
+    return FontRenderer::new::<fonts::u8g2_font_logisoso28_tf>();
+}
+
+/// The heading face (city, condition), sized per panel.
+fn font_title() -> FontRenderer {
+    #[cfg(feature = "badger")]
+    return FontRenderer::new::<fonts::u8g2_font_crox5hb_tf>();
+    #[cfg(feature = "badger2040w")]
+    return FontRenderer::new::<fonts::u8g2_font_crox2hb_tf>();
+}
+
+/// Quantizes the whole canvas for the panel at hand (four grey levels or
+/// one bit).
+fn quantize_full(canvas: &Grey<'_>, levels: &mut [u8]) {
+    let full = Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32));
+    #[cfg(feature = "badger")]
+    dither::quantize(canvas, full, Method::Nearest, levels);
+    #[cfg(feature = "badger2040w")]
+    dither::quantize_mono(canvas, full, Method::Nearest, levels);
+}
+
 /// One fetched report.
 #[derive(Default)]
 struct Report {
@@ -95,24 +155,36 @@ struct Report {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    #[cfg_attr(feature = "badger2040w", allow(unused_mut))]
     let mut p = embassy_rp::init(Default::default());
-    let power_en = Output::new(p.PIN_27, Level::High);
-    core::mem::forget(power_en);
-    bsp::power::sleep_if_reset_held(
-        p.PIN_14.reborrow(),
-        p.PIN_0.reborrow(),
-        p.PIN_1.reborrow(),
-        p.PIN_2.reborrow(),
-        p.PIN_3.reborrow(),
-    )
-    .await;
+    #[cfg(feature = "badger")]
+    {
+        let power_en = Output::new(p.PIN_27.reborrow(), Level::High);
+        core::mem::forget(power_en);
+        bsp::power::sleep_if_reset_held(
+            p.PIN_14.reborrow(),
+            p.PIN_0.reborrow(),
+            p.PIN_1.reborrow(),
+            p.PIN_2.reborrow(),
+            p.PIN_3.reborrow(),
+        )
+        .await;
+    }
+    // The 2040 W runs on a power latch: EN_3V3 high keeps the board alive
+    // (dropping it is how it sleeps — see sleep_until_next).
+    #[cfg(feature = "badger2040w")]
+    let mut power_latch = Output::new(p.PIN_10, Level::High);
 
     let usb_driver = usb::Driver::new(p.USB, Irqs);
     spawner.spawn(bsp::usb::logger_task_with_input(usb_driver).unwrap());
     log::info!("weather booting");
 
+    #[cfg(feature = "badger")]
     let leds = RearLeds::new(p.PWM_SLICE0, p.PWM_SLICE1, p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3);
+    #[cfg(feature = "badger2040w")]
+    let leds = RearLeds::new(p.PWM_SLICE3, p.PIN_22);
     spawner.spawn(bsp::leds::led_task(leds).unwrap());
+    #[cfg(feature = "badger")]
     let buttons = ButtonPins {
         a: Input::new(p.PIN_7, Pull::Up),
         b: Input::new(p.PIN_9, Pull::Up),
@@ -121,18 +193,37 @@ async fn main(spawner: Spawner) {
         down: Input::new(p.PIN_6, Pull::Up),
         home: Input::new(p.PIN_22, Pull::Up),
     };
+    #[cfg(feature = "badger2040w")]
+    let buttons = ButtonPins {
+        a: Input::new(p.PIN_12, Pull::Down),
+        b: Input::new(p.PIN_13, Pull::Down),
+        c: Input::new(p.PIN_14, Pull::Down),
+        up: Input::new(p.PIN_15, Pull::Down),
+        down: Input::new(p.PIN_11, Pull::Down),
+    };
     spawner.spawn(bsp::buttons::button_task(buttons).unwrap());
 
+    #[cfg(feature = "badger")]
     let mut epd = Epd::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_17, p.PIN_20, p.PIN_21, p.PIN_16);
+    #[cfg(feature = "badger2040w")]
+    let mut epd = Epd::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_17, p.PIN_20, p.PIN_21, p.PIN_26);
     epd.init().await;
+    #[cfg(feature = "badger")]
     epd.set_speed(Speed::Slow);
+    #[cfg(feature = "badger2040w")]
+    epd.set_speed(Speed::Default);
 
     let mut rtc = RtcRam::new(p.I2C0, p.PIN_5, p.PIN_4);
     // A fired alarm holds the INT line low; release it before anything else
     // (the POWMAN wake path needs the line high to re-arm).
     rtc.clear_alarm();
     let mut settings = Settings::new(p.FLASH);
+    #[cfg(feature = "badger")]
     let mut battery = Battery::new(p.ADC, p.PIN_26, p.PIN_28, p.PIN_12);
+    // VSYS shares GPIO29 with the radio SPI clock: sample it now, before
+    // wifi::connect claims the pin. Fresh every battery wake (cold boot).
+    #[cfg(feature = "badger2040w")]
+    let mut battery = Battery::sample(p.ADC.reborrow(), p.PIN_29.reborrow(), p.PIN_25.reborrow());
 
     let levels = LEVELS.take();
     let mut canvas = Grey::new(WIDTH, HEIGHT, CANVAS.take());
@@ -221,19 +312,25 @@ async fn main(spawner: Spawner) {
                 bsp::leds::cue(LedCue::Off);
                 epd.present_levels(levels).await;
                 // On battery: arm the next wake and power off entirely.
+                #[cfg(feature = "badger")]
                 if !battery.on_usb() {
                     sleep_until_next(&mut rtc, REFRESH.as_secs() as u32);
                 }
+                #[cfg(feature = "badger2040w")]
+                sleep_until_next(&mut rtc, &mut power_latch, REFRESH.as_secs() as u32).await;
             }
             None => {
                 // Leave the last report up — its "updated" time already
                 // says it is stale. Retry on a short cycle.
                 log::warn!("fetch failed; leaving last report up");
                 bsp::leds::cue(LedCue::Off);
+                #[cfg(feature = "badger")]
                 if !battery.on_usb() {
                     // Do not burn the battery retrying: sleep a short cycle.
                     sleep_until_next(&mut rtc, 5 * 60);
                 }
+                #[cfg(feature = "badger2040w")]
+                sleep_until_next(&mut rtc, &mut power_latch, 5 * 60).await;
                 Timer::after(Duration::from_secs(60)).await;
                 bsp::leds::cue(LedCue::Breathe);
                 continue;
@@ -252,8 +349,29 @@ async fn main(spawner: Spawner) {
     }
 }
 
+/// 2040 W sleep: arm the RTC alarm and drop the EN_3V3 latch. On battery
+/// the board dies here and the alarm (or any front button) re-latches
+/// power — a cold boot, like POWMAN. On USB the rail stays up regardless,
+/// so execution falls through: re-latch and stay awake. No VBUS pin needed.
+#[cfg(feature = "badger2040w")]
+async fn sleep_until_next(rtc: &mut RtcRam, latch: &mut Output<'static>, seconds: u32) {
+    if rtc.set_alarm_in(seconds) {
+        log::info!("sleeping {} s (latch off; alarm + buttons wake)", seconds);
+        Timer::after(Duration::from_millis(50)).await;
+        latch.set_low();
+        Timer::after(Duration::from_millis(500)).await;
+        // Still running: USB is holding the rail up.
+        latch.set_high();
+        rtc.clear_alarm();
+        log::info!("on USB; staying awake");
+    } else {
+        log::warn!("could not arm RTC alarm; staying awake");
+    }
+}
+
 /// Arms the RTC alarm `seconds` out and powers off (POWMAN). Wakes on the
 /// alarm or any front button; never returns on success.
+#[cfg(feature = "badger")]
 fn sleep_until_next(rtc: &mut RtcRam, seconds: u32) {
     if rtc.set_alarm_in(seconds) {
         log::info!("sleeping {} s (alarm + buttons wake)", seconds);
@@ -543,7 +661,7 @@ fn draw_icon(canvas: &mut Grey<'_>, r: &Report, local_hour: u8) {
     // their em box, so anchor-based centering lands visibly low).
     // The icon column is clear of text from the top edge to the rule at
     // y=140 (the city line stays left of it), so center in that full span.
-    let target = Point::new(WIDTH as i32 - 46, 72);
+    let target = Point::new(WIDTH as i32 - 46, ICON_CY);
     let mut at = target;
     if let Ok(Some(bb)) = icons
         .get_rendered_dimensions_aligned(glyph, target, VerticalPosition::Center, HorizontalAlignment::Center)
@@ -561,10 +679,10 @@ fn draw_icon(canvas: &mut Grey<'_>, r: &Report, local_hour: u8) {
     );
     if snow {
         // Snowflakes: asterisks under the cloud.
-        let flakes = FontRenderer::new::<fonts::u8g2_font_crox5hb_tf>();
+        let flakes = font_title();
         let _ = flakes.render_aligned(
             "* * *",
-            center + Point::new(0, 44),
+            center + Point::new(0, SNOW_DY),
             VerticalPosition::Baseline,
             HorizontalAlignment::Center,
             FontColor::Transparent(BLACK),
@@ -592,13 +710,13 @@ fn draw_report(
     (batt_pct, on_usb): (u8, bool),
 ) {
     canvas.fill(255);
-    let big = FontRenderer::new::<fonts::u8g2_font_logisoso42_tf>();
-    let title = FontRenderer::new::<fonts::u8g2_font_crox5hb_tf>();
+    let big = font_big();
+    let title = font_title();
     let small = FontRenderer::new::<fonts::u8g2_font_crox1h_tf>();
 
     let _ = title.render_aligned(
         r.city.as_str(),
-        Point::new(6, 30),
+        Point::new(6, TITLE_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Left,
         FontColor::Transparent(BLACK),
@@ -608,7 +726,7 @@ fn draw_report(
     let _ = write!(temp, "{:.1}\u{00b0}C", r.temp);
     let _ = big.render_aligned(
         temp.as_str(),
-        Point::new(6, 92),
+        Point::new(6, TEMP_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Left,
         FontColor::Transparent(BLACK),
@@ -616,13 +734,13 @@ fn draw_report(
     );
     let _ = title.render_aligned(
         describe(r.code),
-        Point::new(6, 128),
+        Point::new(6, COND_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Left,
         FontColor::Transparent(BLACK),
         canvas,
     );
-    let _ = Line::new(Point::new(6, 140), Point::new(WIDTH as i32 - 6, 140))
+    let _ = Line::new(Point::new(6, RULE_Y), Point::new(WIDTH as i32 - 6, RULE_Y))
         .into_styled(PrimitiveStyle::with_stroke(BLACK, 1))
         .draw(canvas);
     let mut foot = heapless::String::<96>::new();
@@ -633,19 +751,19 @@ fn draw_report(
     );
     let _ = small.render_aligned(
         foot.as_str(),
-        Point::new(6, 158),
+        Point::new(6, STATS_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Left,
         FontColor::Transparent(BLACK),
         canvas,
     );
     // Battery bottom-left, opposite the updated stamp.
-    draw_battery(canvas, Point::new(6, 163), batt_pct, on_usb);
+    draw_battery(canvas, Point::new(6, FOOT_Y - 9), batt_pct, on_usb);
     let mut pct = heapless::String::<8>::new();
     let _ = write!(pct, "{}%", batt_pct);
     let _ = small.render_aligned(
         pct.as_str(),
-        Point::new(34, 172),
+        Point::new(34, FOOT_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Left,
         FontColor::Transparent(BLACK),
@@ -663,29 +781,24 @@ fn draw_report(
         let _ = write!(upd, "updated {:02}:{:02}", hour, minute);
         let _ = small.render_aligned(
             upd.as_str(),
-            Point::new(WIDTH as i32 - 6, 172),
+            Point::new(WIDTH as i32 - 6, FOOT_Y),
             VerticalPosition::Baseline,
             HorizontalAlignment::Right,
             FontColor::Transparent(BLACK),
             canvas,
         );
     }
-    dither::quantize(
-        canvas,
-        Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32)),
-        Method::Nearest,
-        levels,
-    );
+    quantize_full(canvas, levels);
 }
 
 /// A title + one-liner status screen.
 fn draw_message(canvas: &mut Grey<'_>, levels: &mut [u8], head: &str, detail: &str) {
     canvas.fill(255);
-    let title = FontRenderer::new::<fonts::u8g2_font_crox5hb_tf>();
+    let title = font_title();
     let small = FontRenderer::new::<fonts::u8g2_font_crox1h_tf>();
     let _ = title.render_aligned(
         head,
-        Point::new(WIDTH as i32 / 2, 80),
+        Point::new(WIDTH as i32 / 2, MSG_HEAD_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
         FontColor::Transparent(BLACK),
@@ -693,18 +806,13 @@ fn draw_message(canvas: &mut Grey<'_>, levels: &mut [u8], head: &str, detail: &s
     );
     let _ = small.render_aligned(
         detail,
-        Point::new(WIDTH as i32 / 2, 104),
+        Point::new(WIDTH as i32 / 2, MSG_DETAIL_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
         FontColor::Transparent(BLACK),
         canvas,
     );
-    dither::quantize(
-        canvas,
-        Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32)),
-        Method::Nearest,
-        levels,
-    );
+    quantize_full(canvas, levels);
 }
 
 // Rust guideline compliant 2026-08-30

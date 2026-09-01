@@ -107,7 +107,7 @@ async fn main(spawner: Spawner) {
                     Speed::Fast => Speed::Turbo,
                     Speed::Turbo => Speed::Default,
                 };
-                epd.set_speed(next).await;
+                epd.set_speed(next);
             }
             ButtonEvent::Pressed(Button::B) => {}
             ButtonEvent::Pressed(Button::C) => inverted = !inverted,

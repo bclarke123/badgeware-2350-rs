@@ -27,6 +27,7 @@ const PWR: u8 = 0x01;
 const POF: u8 = 0x02;
 const PFS: u8 = 0x03;
 const PON: u8 = 0x04;
+const DSLP: u8 = 0x07;
 const BTST: u8 = 0x06;
 const DSP: u8 = 0x11;
 const DRF: u8 = 0x12;
@@ -132,6 +133,10 @@ impl Epd {
     }
 
     /// Hardware reset and full panel setup for the current speed.
+    ///
+    /// Every present ends by parking the panel in deep sleep (see
+    /// [`Epd::refresh`]), so every present also begins with this — calling
+    /// it manually is only needed to warm the panel before a first draw.
     pub async fn init(&mut self) {
         self.reset.set_low();
         Timer::after(Duration::from_millis(10)).await;
@@ -141,11 +146,10 @@ impl Epd {
         self.setup().await;
     }
 
-    /// Selects the waveform speed for subsequent presents (re-runs panel
-    /// setup — the LUTs live in panel registers).
-    pub async fn set_speed(&mut self, speed: Speed) {
+    /// Selects the waveform speed for subsequent presents (applied by the
+    /// re-init at the start of the next refresh).
+    pub fn set_speed(&mut self, speed: Speed) {
         self.speed = speed;
-        self.setup().await;
     }
 
     /// The current refresh speed.
@@ -228,8 +232,16 @@ impl Epd {
         self.refresh().await;
     }
 
-    /// Powers on, streams the plane, refreshes, waits, powers off.
+    /// Full refresh cycle, ending in deep sleep.
+    ///
+    /// Unlike the SSD1680, a UC8151 left merely powered-off scribbles
+    /// random lines on the panel as its supply rail collapses (unplugging
+    /// USB, dropping the EN_3V3 latch). Deep sleep deafens the controller
+    /// until the next hardware reset, so every refresh re-inits on the way
+    /// in and parks the panel comatose on the way out — a power cut can
+    /// then never reach a listening controller.
     async fn refresh(&mut self) {
+        self.init().await;
         self.command(PON, &[]);
         self.command(PTOU, &[]);
         self.command_long(DTM2);
@@ -239,6 +251,7 @@ impl Epd {
         self.busy_wait().await;
         self.command(POF, &[]);
         self.busy_wait().await;
+        self.command(DSLP, &[0xA5]);
     }
 
     /// BUSY is active low; yield until the panel is idle.

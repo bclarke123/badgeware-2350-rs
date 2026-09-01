@@ -7,6 +7,9 @@
 //! cue — the "working on it" light for network fetches and other waits.
 
 use embassy_futures::select::{select, Either};
+#[cfg(feature = "badger2040w")]
+use embassy_rp::peripherals::{PIN_22, PWM_SLICE3};
+#[cfg(not(feature = "badger2040w"))]
 use embassy_rp::peripherals::{PIN_0, PIN_1, PIN_2, PIN_3, PWM_SLICE0, PWM_SLICE1};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_rp::Peri;
@@ -46,11 +49,36 @@ const BREATHE_MS: u64 = 2600;
 /// Milliseconds per breathe brightness step.
 const BREATHE_STEP_MS: u64 = 20;
 
+/// The Badger 2040 W's single front LED (GPIO22, PWM slice 3 channel A),
+/// behind the same cue API as the four-zone boards.
+#[cfg(feature = "badger2040w")]
+pub struct RearLeds {
+    slice: Pwm<'static>,
+}
+
+#[cfg(feature = "badger2040w")]
+impl RearLeds {
+    /// Configures the LED pin as a PWM output, off.
+    pub fn new(slice3: Peri<'static, PWM_SLICE3>, led: Peri<'static, PIN_22>) -> Self {
+        Self { slice: Pwm::new_output_a(slice3, led, config(0)) }
+    }
+
+    fn set_duty(&mut self, duty: u16) {
+        self.slice.set_config(&config(duty));
+    }
+
+    fn set_all(&mut self, on: bool) {
+        self.set_duty(if on { TOP } else { 0 });
+    }
+}
+
 /// The four rear LED zones on PWM slices 0 and 1.
+#[cfg(not(feature = "badger2040w"))]
 pub struct RearLeds {
     slices: [Pwm<'static>; 2],
 }
 
+#[cfg(not(feature = "badger2040w"))]
 impl RearLeds {
     /// Configures the four zone pins as PWM outputs, all off.
     pub fn new(

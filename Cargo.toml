@@ -49,10 +49,13 @@ default = ["tufty"]
 # Pimoroni Tufty 2350: RP2350B, 320x240 ST7789 LCD on an 8-bit parallel bus.
 tufty = ["embassy-rp/rp235xb"]
 # Pimoroni Badger 2350: RP2350A, 264x176 four-grey SSD1680 e-paper on SPI0.
-badger = ["embassy-rp/rp235xa"]
+badger = ["embassy-rp/rp235xa", "_epaper"]
 # Pimoroni Badger 2040 W: RP2040 (Pico W), 296x128 1-bit UC8151 e-paper.
 # Build with --target thumbv6m-none-eabi.
-badger2040w = ["embassy-rp/rp2040", "embassy-rp/boot2-w25q080"]
+badger2040w = ["embassy-rp/rp2040", "embassy-rp/boot2-w25q080", "_epaper"]
+# Internal: examples that run on any e-paper badge (required-features has
+# no OR, so both badger features imply this one).
+_epaper = []
 
 [[example]]
 name = "simon"
@@ -76,7 +79,7 @@ required-features = ["badger"]
 
 [[example]]
 name = "weather"
-required-features = ["badger"]
+required-features = ["_epaper"]
 
 [[example]]
 name = "chess"

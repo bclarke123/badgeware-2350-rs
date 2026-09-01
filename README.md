@@ -29,7 +29,7 @@ worth mentioning.
 | `epd_test` | badger | E-paper test card: the four panel greys, dither comparisons (Bayer 4×4/8×8, Floyd–Steinberg), supersampled text, live calibration on the buttons. |
 | `badge` | badger | Name badge driven by `examples/badge.vcf`: big name, social handles parsed from URLs (`GH: you`, `LI: you`), and a scannable vCard QR. |
 | `totp` | badger | Six-digit authenticator: battery-backed RTC, secret in flash, provisioning over USB serial, seven-segment digits with a draining 30 s bar. |
-| `weather` | badger | Ambient weather station: joins WiFi, geolocates by IP, fetches Open-Meteo, syncs the RTC from NTP, and refreshes every 15 min with condition icons and a battery gauge. |
+| `weather` | badger, badger2040w | Ambient weather station: joins WiFi, geolocates by IP, fetches Open-Meteo, syncs the RTC from NTP, and refreshes every 15 min with condition icons and a battery gauge. |
 | `chess` | badger | Play White against Stockfish at chess-api.com over TLS 1.3. `cozy-chess` legal moves on five buttons, eval + captured pieces in the panel, game persisted across power-off. |
 | `marquee` | badger | Concert beacon: hold A and the badge becomes a hotspot with a join-QR; your phone's captive-portal sheet pops a form, and the message renders as big as it fits. No app, no shared network, no typed URLs. |
 | `reader` | badger | E-reader: streams a Project Gutenberg book over TLS into the 8 MB PSRAM (progress bar included), then pages it on the e-paper — word wrap, typography cleanup, persistent bookmark, page-up/-down from any point. |
