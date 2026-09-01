@@ -218,8 +218,18 @@ fn enter_off() -> ! {
         };
         pm_write(state, req);
 
-        // If the request lands, execution ends inside this delay.
-        cortex_m::asm::delay(15_000_000); // ~100 ms
+        // POWMAN completes the power-down only while the processor sleeps
+        // in WFI. Arm SysTick (~100 ms) so an ABANDONED request wakes us
+        // to retry — a pended-but-masked interrupt wakes WFI without
+        // running its handler. A successful power-off ends execution here.
+        // SAFETY: raw SysTick register writes (CSR/RVR/CVR); the values
+        // enable the counter with interrupt from the core clock.
+        unsafe {
+            core::ptr::write_volatile(0xE000_E014 as *mut u32, 15_000_000); // RVR ~100 ms
+            core::ptr::write_volatile(0xE000_E018 as *mut u32, 0); // CVR reset
+            core::ptr::write_volatile(0xE000_E010 as *mut u32, 0b111); // enable + tickint + core clock
+        }
+        cortex_m::asm::wfi();
         log::warn!("power: off request abandoned (attempt {})", attempt + 1);
 
         // A glitch re-latched a wake edge: clear channel status and retry.
