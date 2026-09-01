@@ -9,7 +9,6 @@
 
 #[cfg(feature = "tufty")]
 pub mod backlight;
-#[cfg(any(feature = "badger", feature = "badger2040w"))]
 pub mod battery;
 pub mod buttons;
 #[cfg(feature = "tufty")]

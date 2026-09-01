@@ -12,16 +12,92 @@
 //!
 //! Uses the blocking ADC (a battery sample is 20 conversions, microseconds).
 
+#[cfg(not(feature = "tufty"))]
 use embassy_rp::adc::{Adc, Blocking, Channel, Config};
-#[cfg(feature = "badger")]
+#[cfg(any(feature = "badger", feature = "tufty"))]
 use embassy_rp::gpio::Input;
+#[cfg(not(feature = "tufty"))]
 use embassy_rp::gpio::Pull;
+#[cfg(feature = "tufty")]
+use embassy_rp::gpio::Pull;
+#[cfg(feature = "tufty")]
+use embassy_rp::peripherals::PIN_12 as VBUS_PIN;
 #[cfg(feature = "badger")]
 use embassy_rp::peripherals::{PIN_12, PIN_26, PIN_28};
+#[cfg(not(feature = "tufty"))]
+use embassy_rp::peripherals::ADC;
+#[cfg(feature = "tufty")]
+use core::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "badger2040w")]
 use embassy_rp::peripherals::{PIN_25, PIN_29};
-use embassy_rp::peripherals::ADC;
 use embassy_rp::Peri;
+
+/// Estimated charge 0..=100 from a piecewise-linear single-cell LiPo
+/// discharge curve, from a millivolt reading.
+#[cfg(any(feature = "tufty", feature = "badger2040w"))]
+fn lipo_percent(mv: u32) -> u8 {
+    const CURVE: [(u32, u8); 10] = [
+        (4150, 100),
+        (4050, 92),
+        (3950, 82),
+        (3850, 70),
+        (3750, 55),
+        (3650, 38),
+        (3550, 20),
+        (3450, 10),
+        (3300, 4),
+        (3000, 0),
+    ];
+    if mv >= CURVE[0].0 {
+        return 100;
+    }
+    for pair in CURVE.windows(2) {
+        let ((hi_v, hi_p), (lo_v, lo_p)) = (pair[0], pair[1]);
+        if mv >= lo_v {
+            let f = (mv - lo_v) * 100 / (hi_v - lo_v);
+            return (u32::from(lo_p) + (u32::from(hi_p) - u32::from(lo_p)) * f / 100) as u8;
+        }
+    }
+    0
+}
+
+/// Battery monitor (Tufty 2350): consumes VBAT readings published by the
+/// auto-backlight task (which owns the ADC; `VBAT_SENSE` is GPIO40 through
+/// a 2:1 divider, uncalibrated — the Tufty has no spare reference pin).
+/// `VBUS_DETECT` (GPIO12) is high on USB power. Readings are `None` until
+/// the first sample lands (~0.5 s after boot).
+#[cfg(feature = "tufty")]
+static VBAT_MV: AtomicU32 = AtomicU32::new(0);
+
+/// Publishes a smoothed VBAT millivolt reading (called by the
+/// auto-backlight task, which owns the ADC).
+#[cfg(feature = "tufty")]
+pub fn publish_vbat_mv(mv: u32) {
+    VBAT_MV.store(mv, Ordering::Relaxed);
+}
+
+#[cfg(feature = "tufty")]
+pub struct Battery {
+    vbus: Input<'static>,
+}
+
+#[cfg(feature = "tufty")]
+impl Battery {
+    pub fn new(vbus: Peri<'static, VBUS_PIN>) -> Self {
+        Self { vbus: Input::new(vbus, Pull::None) }
+    }
+
+    /// Estimated charge, once the first VBAT sample has been published.
+    pub fn percent(&mut self) -> Option<u8> {
+        let mv = VBAT_MV.load(Ordering::Relaxed);
+        (mv > 0).then(|| lipo_percent(mv))
+    }
+
+    /// USB power present.
+    pub fn on_usb(&self) -> bool {
+        self.vbus.is_high()
+    }
+}
 
 /// Battery monitor (Badger 2040 W): a single VSYS sample taken at boot.
 ///
@@ -67,33 +143,12 @@ impl Battery {
         self.vsys_mv as f32 / 1000.0
     }
 
-    /// Estimated charge 0..=100 from a piecewise-linear LiPo discharge
-    /// curve (the board runs a single-cell pack on the JST connector).
+    /// Estimated charge 0..=100 (single-cell LiPo on the JST connector).
     pub fn percent(&mut self) -> u8 {
-        const CURVE: [(u32, u8); 10] = [
-            (4150, 100),
-            (4050, 92),
-            (3950, 82),
-            (3850, 70),
-            (3750, 55),
-            (3650, 38),
-            (3550, 20),
-            (3450, 10),
-            (3300, 4),
-            (3000, 0),
-        ];
-        let v = self.vsys_mv;
-        if self.on_usb() || v >= CURVE[0].0 {
+        if self.on_usb() {
             return 100;
         }
-        for pair in CURVE.windows(2) {
-            let ((hi_v, hi_p), (lo_v, lo_p)) = (pair[0], pair[1]);
-            if v >= lo_v {
-                let f = (v - lo_v) * 100 / (hi_v - lo_v);
-                return (u32::from(lo_p) + (u32::from(hi_p) - u32::from(lo_p)) * f / 100) as u8;
-            }
-        }
-        0
+        lipo_percent(self.vsys_mv)
     }
 
     /// USB power present (VSYS is VBUS-shaped, not battery-shaped).

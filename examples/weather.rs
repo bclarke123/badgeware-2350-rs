@@ -129,6 +129,14 @@ fn font_title() -> FontRenderer {
     return FontRenderer::new::<fonts::u8g2_font_crox2hb_tf>();
 }
 
+/// Time-boxes one network phase. Every wake MUST end in sleep: a DNS query
+/// or TCP connect into a black-holed network can otherwise await forever,
+/// leaving the badge awake with the radio on until the battery dies
+/// (measured: one such night cost 12%).
+async fn bounded<T>(fut: impl core::future::Future<Output = Option<T>>) -> Option<T> {
+    with_timeout(Duration::from_secs(45), fut).await.ok().flatten()
+}
+
 /// Quantizes the whole canvas for the panel at hand (four grey levels or
 /// one bit).
 fn quantize_full(canvas: &Grey<'_>, levels: &mut [u8]) {
@@ -168,7 +176,7 @@ async fn main(spawner: Spawner) {
             p.PIN_2.reborrow(),
             p.PIN_3.reborrow(),
         )
-        .await;
+        .await
     }
     // The 2040 W runs on a power latch: EN_3V3 high keeps the board alive
     // (dropping it is how it sleeps — see sleep_until_next).
@@ -251,6 +259,16 @@ async fn main(spawner: Spawner) {
         Ok(w) => w,
         Err(e) => {
             log::warn!("join failed: {:?}", e);
+            // On battery, a failed join is far more likely a 3 AM router
+            // reboot than bad credentials: keep the last report up, sleep,
+            // and retry next cycle. The setup screen is for USB, where a
+            // human is present to type.
+            #[cfg(feature = "badger")]
+            if !battery.on_usb() {
+                sleep_until_next(&mut rtc, REFRESH.as_secs() as u32);
+            }
+            #[cfg(feature = "badger2040w")]
+            sleep_until_next(&mut rtc, &mut power_latch, REFRESH.as_secs() as u32).await;
             bsp::leds::cue(LedCue::Error);
             draw_message(&mut canvas, levels, "Join failed", "send WIFI <ssid> <pass>, then reboot");
             epd.present_levels(levels).await;
@@ -283,11 +301,11 @@ async fn main(spawner: Spawner) {
     }
     loop {
         // NTP first (also provisions the RTC for other apps).
-        if let Some(unix) = sntp(stack).await {
+        if let Some(unix) = bounded(sntp(stack)).await {
             set_rtc_from_unix(&mut rtc, unix);
         }
         if geo.is_none() {
-            geo = geolocate(stack, response).await;
+            geo = bounded(geolocate(stack, response)).await;
             if let Some((lat, lon, off, city)) = &geo {
                 let mut blob = heapless::String::<64>::new();
                 let _ = write!(blob, "{:.4} {:.4} {} {}", lat, lon, off, city);
@@ -296,7 +314,7 @@ async fn main(spawner: Spawner) {
         }
         let report = match &geo {
             Some((lat, lon, offset, city)) => {
-                let mut r = fetch_weather(stack, response, *lat, *lon, city).await;
+                let mut r = bounded(fetch_weather(stack, response, *lat, *lon, city)).await;
                 if let Some(r) = &mut r {
                     r.utc_offset = *offset;
                 }
@@ -485,7 +503,10 @@ fn set_rtc_from_unix(rtc: &mut RtcRam, unix: u64) {
 
 /// DNS A lookup.
 async fn resolve(stack: embassy_net::Stack<'static>, host: &str) -> Option<IpAddress> {
-    let addrs = stack.dns_query(host, DnsQueryType::A).await.ok()?;
+    let addrs = with_timeout(Duration::from_secs(10), stack.dns_query(host, DnsQueryType::A))
+        .await
+        .ok()?
+        .ok()?;
     addrs.first().copied()
 }
 
@@ -507,14 +528,17 @@ async fn http_get<'a>(
     let mut tx = [0u8; 1024];
     let mut sock = TcpSocket::new(stack, &mut rx, &mut tx);
     sock.set_timeout(Some(Duration::from_secs(10)));
-    if let Err(e) = sock.connect((addr, 80)).await {
+    let connected = with_timeout(Duration::from_secs(10), sock.connect((addr, 80))).await;
+    if !matches!(connected, Ok(Ok(()))) {
+        let e = connected;
         log::warn!("http {}: connect {:?}: {:?}", host, addr, e);
         return None;
     }
     let mut req = heapless::String::<512>::new();
     let _ = write!(req, "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: badger2350\r\n\r\n", path, host);
-    if let Err(e) = sock.write_all(req.as_bytes()).await {
-        log::warn!("http {}: write: {:?}", host, e);
+    let wrote = with_timeout(Duration::from_secs(10), sock.write_all(req.as_bytes())).await;
+    if !matches!(wrote, Ok(Ok(()))) {
+        log::warn!("http {}: write failed: {:?}", host, wrote);
         return None;
     }
     let mut n = 0usize;
@@ -646,9 +670,9 @@ fn describe(code: u16) -> &'static str {
 fn draw_icon(canvas: &mut Grey<'_>, r: &Report, local_hour: u8) {
     let icons = FontRenderer::new::<fonts::u8g2_font_open_iconic_weather_8x_t>();
     let day = (7..19).contains(&local_hour);
-    // 64 cloud, 65 sun+cloud, 66 moon, 67 rain, 68 sun.
+    // 64 cloud, 65 sun+cloud, 66 moon, 67 rain, 68 star, 69 sun.
     let (glyph, snow, bolt) = match r.code {
-        0 => (if day { '\u{44}' } else { '\u{42}' }, false, false),
+        0 => (if day { '\u{45}' } else { '\u{42}' }, false, false),
         1 | 2 => (if day { '\u{41}' } else { '\u{42}' }, false, false),
         3 | 45 | 48 => ('\u{40}', false, false),
         51..=67 | 80..=82 => ('\u{43}', false, false),

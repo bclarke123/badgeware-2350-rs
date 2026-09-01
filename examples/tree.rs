@@ -140,7 +140,8 @@ async fn main(spawner: Spawner) {
         // Light sensor for automatic backlight (GPIO43 / ADC).
         let adc = adc::Adc::new(p.ADC, Irqs, adc::Config::default());
         let light = adc::Channel::new_pin(p.PIN_43, Pull::None);
-        spawner.spawn(bsp::backlight::auto_backlight_task(adc, light).unwrap());
+        let vbat = adc::Channel::new_pin(p.PIN_40, Pull::None);
+        spawner.spawn(bsp::backlight::auto_backlight_task(adc, light, vbat).unwrap());
 
         // First frame is black; light the backlight only after it is on
         // screen so power-on never shows random panel RAM.

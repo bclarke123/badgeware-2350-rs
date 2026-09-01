@@ -10,7 +10,9 @@
 //! the piece deselects; promotions auto-queen). Cursor movement uses partial
 //! panel refreshes (only the touched column bands re-scan — no full-screen
 //! blink); committed moves get a full TURBO refresh, with a SLOW clean every
-//! several moves. Hold **B** two seconds for a new game.
+//! several moves. Hold **B** two seconds for a new game. The title card
+//! picks the engine strength (A easy / B medium / C hard = depth 4/8/13)
+//! and returns after every game over.
 //!
 //! The game (FEN) is saved to the settings sector after every move, so it
 //! survives power-off and reflashing. WiFi credentials come from the same
@@ -46,7 +48,13 @@ use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::{fonts, FontRenderer};
 
 use tufty_2350::bsp;
+#[cfg(feature = "tufty")]
+use tufty_2350::bsp::backlight::Backlight;
+use tufty_2350::bsp::battery::Battery;
 use tufty_2350::bsp::buttons::{Button, ButtonEvent, ButtonPins, EVENTS};
+#[cfg(feature = "tufty")]
+use tufty_2350::bsp::display::Display;
+#[cfg(feature = "badger")]
 use tufty_2350::bsp::epd::{Epd, Speed};
 use tufty_2350::bsp::leds::RearLeds;
 use tufty_2350::bsp::screen::{HEIGHT, WIDTH};
@@ -54,11 +62,23 @@ use tufty_2350::bsp::settings::{Settings, MAX_VAL};
 use tufty_2350::bsp::wifi::{self, Wifi};
 use tufty_2350::gfx::dither::{self, Method as Dither};
 use tufty_2350::gfx::grey::Grey;
+use tufty_2350::gfx::widgets::draw_battery;
+#[cfg(feature = "tufty")]
+use tufty_2350::gfx::{FrameBuffer, FB_BYTES};
 
+#[cfg(feature = "badger")]
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
     DMA_IRQ_0 => dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>;
+});
+#[cfg(feature = "tufty")]
+bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => usb::InterruptHandler<USB>;
+    PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
+    PIO1_IRQ_0 => pio::InterruptHandler<embassy_rp::peripherals::PIO1>;
+    ADC_IRQ_FIFO => embassy_rp::adc::InterruptHandler;
+    DMA_IRQ_0 => dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>, dma::InterruptHandler<embassy_rp::peripherals::DMA_CH1>;
 });
 
 static CANVAS: ConstStaticCell<[u8; WIDTH * HEIGHT]> = ConstStaticCell::new([0; WIDTH * HEIGHT]);
@@ -73,10 +93,19 @@ const BLACK: Gray8 = Gray8::new(0);
 /// Dark squares: quantizes to the light-grey panel level.
 const DARK_SQ: Gray8 = Gray8::new(190);
 
-/// Board geometry: 8 x 20 px squares with a 2 px frame.
+/// Board geometry: 8 squares with a 2 px frame, sized per screen.
+#[cfg(feature = "badger")]
 const SQ: i32 = 20;
+#[cfg(feature = "badger")]
 const BX: i32 = 2;
+#[cfg(feature = "badger")]
 const BY: i32 = 8;
+#[cfg(feature = "tufty")]
+const SQ: i32 = 24;
+#[cfg(feature = "tufty")]
+const BX: i32 = 10;
+#[cfg(feature = "tufty")]
+const BY: i32 = 24;
 
 /// Radio idle timeout before leaving the network.
 const WIFI_IDLE: Duration = Duration::from_secs(5 * 60);
@@ -84,9 +113,59 @@ const WIFI_IDLE: Duration = Duration::from_secs(5 * 60);
 /// SLOW clean refresh every this many committed moves.
 const CLEAN_EVERY: u32 = 8;
 
+#[cfg(feature = "tufty")]
+static FRAMEBUFFER: ConstStaticCell<[u8; FB_BYTES]> = ConstStaticCell::new([0; FB_BYTES]);
+
+/// The per-board output device behind one present-shaped API: quantized
+/// grey planes on the Badger's e-paper, a luma-to-RGB565 blit and a
+/// TE-synced DMA present on the Tufty's LCD.
+struct Screen {
+    #[cfg(feature = "badger")]
+    epd: Epd,
+    #[cfg(feature = "tufty")]
+    display: Display,
+    #[cfg(feature = "tufty")]
+    frame: FrameBuffer,
+}
+
+impl Screen {
+    /// Puts the drawn canvas on the panel.
+    #[allow(unused_variables, reason = "each board uses one of the two args")]
+    async fn show(&mut self, canvas: &Grey<'_>, levels: &[u8]) {
+        #[cfg(feature = "badger")]
+        self.epd.present_levels(levels).await;
+        #[cfg(feature = "tufty")]
+        {
+            use embedded_graphics::pixelcolor::Rgb565;
+            let full = Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32));
+            let _ = self.frame.fill_contiguous(
+                &full,
+                (0..WIDTH * HEIGHT).map(|i| {
+                    let l = canvas.get(i % WIDTH, i / WIDTH);
+                    Rgb565::new(l >> 3, l >> 2, l >> 3)
+                }),
+            );
+            let t0 = embassy_time::Instant::now();
+            self.display.present(self.frame.bytes()).await;
+            log::info!("present: {} ms", t0.elapsed().as_millis());
+        }
+    }
+
+    /// E-paper waveform choice; a no-op on the LCD, where every present is
+    /// already instant and clean.
+    #[allow(unused_variables, reason = "the LCD has no waveform to choose")]
+    fn set_slow(&mut self, slow: bool) {
+        #[cfg(feature = "badger")]
+        self.epd.set_speed(if slow { Speed::Slow } else { Speed::Turbo });
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let mut p = embassy_rp::init(Default::default());
+    #[cfg(feature = "tufty")]
+    let power_en = Output::new(p.PIN_41, Level::High);
+    #[cfg(feature = "badger")]
     let power_en = Output::new(p.PIN_27, Level::High);
     core::mem::forget(power_en);
     bsp::power::sleep_if_reset_held(
@@ -114,8 +193,37 @@ async fn main(spawner: Spawner) {
     };
     spawner.spawn(bsp::buttons::button_task(buttons).unwrap());
 
-    let mut epd = Epd::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_17, p.PIN_20, p.PIN_21, p.PIN_16);
-    epd.init().await;
+    #[cfg(feature = "badger")]
+    let mut screen = {
+        let mut epd = Epd::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_17, p.PIN_20, p.PIN_21, p.PIN_16);
+        epd.init().await;
+        Screen { epd }
+    };
+    #[cfg(feature = "tufty")]
+    let mut screen = {
+        // Backlight off until the first frame has been presented.
+        let mut backlight = Backlight::new(p.PWM_SLICE5, p.PIN_26);
+        let dma_ch = dma::Channel::new(p.DMA_CH0, Irqs);
+        let mut display = Display::new(
+            p.PIO1, Irqs, dma_ch, p.PIN_21, p.PIN_27, p.PIN_28, p.PIN_30, p.PIN_31, p.PIN_32,
+            p.PIN_33, p.PIN_34, p.PIN_35, p.PIN_36, p.PIN_37, p.PIN_38, p.PIN_39,
+        );
+        display.init().await;
+        let frame = FrameBuffer::new(FRAMEBUFFER.take());
+        display.present(frame.bytes()).await;
+        backlight.set_brightness(200);
+        let adc = embassy_rp::adc::Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
+        let light = embassy_rp::adc::Channel::new_pin(p.PIN_43, Pull::None);
+        let vbat = embassy_rp::adc::Channel::new_pin(p.PIN_40, Pull::None);
+        spawner.spawn(bsp::backlight::auto_backlight_task(adc, light, vbat).unwrap());
+        spawner.spawn(bsp::backlight::backlight_task(backlight).unwrap());
+        Screen { display, frame }
+    };
+
+    #[cfg(feature = "badger")]
+    let mut battery = Battery::new(p.ADC, p.PIN_26, p.PIN_28, p.PIN_12);
+    #[cfg(feature = "tufty")]
+    let mut battery = Battery::new(p.PIN_12);
 
     let mut settings = Settings::new(p.FLASH);
     let levels = LEVELS.take();
@@ -129,11 +237,61 @@ async fn main(spawner: Spawner) {
         .and_then(|f| Board::from_fen(f, false).ok())
         .unwrap_or_default();
 
+    // ---- First light: prove the panel works before any waiting.
+    let mut ui = Ui { cursor: Square::E2, selected: None, eval: None, thinking: false, note: heapless::String::new() };
+    let _ = ui.note.push_str("starting...");
+    full_draw(&mut canvas, levels, &board, &ui, None, bat(&mut battery));
+    screen.show(&canvas, levels).await;
+
     // ---- WiFi: lazy. Credentials looked up now, joined on first engine call.
     let mut cred = [0u8; MAX_VAL];
-    let cred_len = settings.get("wifi", &mut cred).map(<[u8]>::len).unwrap_or(0);
+    let mut cred_len = settings.get("wifi", &mut cred).map(<[u8]>::len).unwrap_or(0);
+    // No credentials and a USB host present: offer one shot at serial
+    // provisioning (`WIFI <ssid> <password>`); any button skips to hot-seat.
+    if cred_len == 0 && battery.on_usb() {
+        log::info!("no wifi credentials: send `WIFI <ssid> <password>`, or press any button for hot-seat");
+        // Never wait on a dark screen: show the board with a hint.
+        ui.note.clear();
+        let _ = ui.note.push_str("serial: WIFI ...");
+        full_draw(&mut canvas, levels, &board, &ui, None, bat(&mut battery));
+        screen.show(&canvas, levels).await;
+        let mut line = heapless::String::<128>::new();
+        loop {
+            use embassy_futures::select::{select, Either};
+            match select(bsp::usb::read_line(&mut line), EVENTS.receive()).await {
+                Either::First(entered) => {
+                    let Some((ssid, pass)) = parse_wifi(entered) else {
+                        log::warn!("expected: WIFI <ssid> <password> (quote an ssid with spaces)");
+                        continue;
+                    };
+                    let total = ssid.len() + 1 + pass.len();
+                    if ssid.is_empty() || total > MAX_VAL {
+                        log::warn!("credentials too long");
+                        continue;
+                    }
+                    let mut blob = [0u8; MAX_VAL];
+                    blob[..ssid.len()].copy_from_slice(ssid.as_bytes());
+                    blob[ssid.len() + 1..total].copy_from_slice(pass.as_bytes());
+                    if settings.set("wifi", &blob[..total]) {
+                        cred[..total].copy_from_slice(&blob[..total]);
+                        cred_len = total;
+                        log::info!("stored; joining");
+                    }
+                    break;
+                }
+                Either::Second(_) => break,
+            }
+        }
+    }
     let mut net = if cred_len > 0 {
+        ui.note.clear();
+        let _ = ui.note.push_str("wifi: joining...");
+        full_draw(&mut canvas, levels, &board, &ui, None, bat(&mut battery));
+        screen.show(&canvas, levels).await;
+        #[cfg(feature = "badger")]
         let dma_ch = dma::Channel::new(p.DMA_CH0, Irqs);
+        #[cfg(feature = "tufty")]
+        let dma_ch = dma::Channel::new(p.DMA_CH1, Irqs);
         let (ssid, pass) = split_cred(&cred[..cred_len]);
         match wifi::connect(spawner, p.PIO0, Irqs, dma_ch, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, ssid, pass).await
         {
@@ -150,23 +308,24 @@ async fn main(spawner: Spawner) {
     let tcp_state = TCP_STATE.take();
     let (tls_rx, tls_tx, http_rx) = (TLS_RX.take(), TLS_TX.take(), HTTP_RX.take());
 
-    let mut ui = Ui { cursor: Square::E2, selected: None, eval: None, thinking: false, note: heapless::String::new() };
+    ui.note.clear();
     let mut moves_done = 0u32;
-    epd.set_speed(Speed::Slow);
-    full_draw(&mut canvas, levels, &board, &ui, net.as_ref());
-    epd.present_levels(levels).await;
+    let mut depth = title_screen(&mut screen, &mut canvas, levels).await;
+    screen.set_slow(true);
+    full_draw(&mut canvas, levels, &board, &ui, net.as_ref(), bat(&mut battery));
+    screen.show(&canvas, levels).await;
 
     loop {
         // ---- Engine (Black) to move?
         if board.side_to_move() == Color::Black && board.status() == GameStatus::Ongoing {
             if let Some(net) = &mut net {
                 ui.thinking = true;
-                full_draw(&mut canvas, levels, &board, &ui, Some(net));
-                epd.set_speed(Speed::Turbo);
-                epd.present_levels(levels).await;
+                full_draw(&mut canvas, levels, &board, &ui, Some(net), bat(&mut battery));
+                screen.set_slow(false);
+                screen.show(&canvas, levels).await;
 
                 ensure_joined(net, &cred[..cred_len]).await;
-                let reply = engine_move(net, tcp_state, tls_rx, tls_tx, http_rx, &board).await;
+                let reply = engine_move(net, tcp_state, tls_rx, tls_tx, http_rx, &board, depth).await;
                 net.last_use = Instant::now();
                 ui.thinking = false;
                 match reply {
@@ -183,9 +342,9 @@ async fn main(spawner: Spawner) {
                     }
                 }
                 sync_cursor(&board, &mut ui);
-                epd.set_speed(if moves_done.is_multiple_of(CLEAN_EVERY) { Speed::Slow } else { Speed::Turbo });
-                full_draw(&mut canvas, levels, &board, &ui, Some(net));
-                epd.present_levels(levels).await;
+                screen.set_slow(moves_done.is_multiple_of(CLEAN_EVERY));
+                full_draw(&mut canvas, levels, &board, &ui, Some(net), bat(&mut battery));
+                screen.show(&canvas, levels).await;
                 if ui.note.is_empty() {
                     continue;
                 }
@@ -193,26 +352,64 @@ async fn main(spawner: Spawner) {
             // Hot-seat (or engine offline): the player moves Black too.
         }
 
-        // ---- Wait for input; also expire the radio when idle.
+        // ---- Wait for input; also expire the radio when idle, and accept
+        // replacement WiFi credentials over serial at ANY time (stored,
+        // then a clean reboot applies them — no way to be locked out by a
+        // typo'd password again).
         let event = loop {
+            use embassy_futures::select::{select3, Either3};
             let timeout = Timer::after(Duration::from_secs(30));
-            match embassy_futures::select::select(EVENTS.receive(), timeout).await {
-                embassy_futures::select::Either::First(ev) => break ev,
-                embassy_futures::select::Either::Second(()) => {
+            let mut line = heapless::String::<128>::new();
+            match select3(EVENTS.receive(), timeout, bsp::usb::read_line(&mut line)).await {
+                Either3::First(ev) => break ev,
+                Either3::Second(()) => {
                     if let Some(net) = &mut net {
                         if net.joined && net.last_use.elapsed() > WIFI_IDLE {
                             net.wifi.leave().await;
                             net.joined = false;
-                            full_draw(&mut canvas, levels, &board, &ui, Some(net));
-                            epd.set_speed(Speed::Turbo);
-                            epd.present_levels(levels).await;
+                            full_draw(&mut canvas, levels, &board, &ui, Some(net), bat(&mut battery));
+                            screen.set_slow(false);
+                            screen.show(&canvas, levels).await;
                         }
+                    }
+                }
+                Either3::Third(entered) => {
+                    if let Some((ssid, pass)) = parse_wifi(entered) {
+                        let total = ssid.len() + 1 + pass.len();
+                        if !ssid.is_empty() && total <= MAX_VAL {
+                            let mut blob = [0u8; MAX_VAL];
+                            blob[..ssid.len()].copy_from_slice(ssid.as_bytes());
+                            blob[ssid.len() + 1..total].copy_from_slice(pass.as_bytes());
+                            if settings.set("wifi", &blob[..total]) {
+                                log::info!("credentials stored; rebooting to apply");
+                                Timer::after(Duration::from_millis(100)).await;
+                                embassy_rp::rom_data::reboot(0x0000, 100, 0, 0);
+                            }
+                        }
+                        log::warn!("credentials rejected (empty ssid or too long)");
+                    } else if !entered.is_empty() {
+                        log::warn!("unknown command: {}", entered);
                     }
                 }
             }
         };
 
         let ButtonEvent::Pressed(button) = event else { continue };
+
+        // Game over: the final board stays up until a button is pressed,
+        // then the title screen starts the next game.
+        if board.status() != GameStatus::Ongoing {
+            let _ = settings.set("chess", b"");
+            depth = title_screen(&mut screen, &mut canvas, levels).await;
+            board = Board::default();
+            save_fen(&mut settings, &board);
+            ui = Ui { cursor: Square::E2, selected: None, eval: None, thinking: false, note: heapless::String::new() };
+            moves_done = 0;
+            screen.set_slow(true);
+            full_draw(&mut canvas, levels, &board, &ui, net.as_ref(), bat(&mut battery));
+            screen.show(&canvas, levels).await;
+            continue;
+        }
 
         // An engine failure note showing while Black is to move: any press
         // clears it and retries the request (transient network failures
@@ -228,14 +425,10 @@ async fn main(spawner: Spawner) {
             save_fen(&mut settings, &board);
             ui = Ui { cursor: Square::E2, selected: None, eval: None, thinking: false, note: heapless::String::new() };
             moves_done = 0;
-            epd.set_speed(Speed::Slow);
-            full_draw(&mut canvas, levels, &board, &ui, net.as_ref());
-            epd.present_levels(levels).await;
+            screen.set_slow(true);
+            full_draw(&mut canvas, levels, &board, &ui, net.as_ref(), bat(&mut battery));
+            screen.show(&canvas, levels).await;
             continue;
-        }
-
-        if board.status() != GameStatus::Ongoing {
-            continue; // game over: only new-game hold applies
         }
 
         let old_cursor = ui.cursor;
@@ -277,18 +470,18 @@ async fn main(spawner: Spawner) {
             ui.eval = None;
             moves_done += 1;
             sync_cursor(&board, &mut ui);
-            epd.set_speed(Speed::Turbo);
-            full_draw(&mut canvas, levels, &board, &ui, net.as_ref());
-            epd.present_levels(levels).await;
+            screen.set_slow(false);
+            full_draw(&mut canvas, levels, &board, &ui, net.as_ref(), bat(&mut battery));
+            screen.show(&canvas, levels).await;
         } else if ui.cursor != old_cursor || ui.selected != old_sel {
             // Cursor/selection change. Full TURBO refresh: partial band
             // refreshes were tried first and are faster, but every partial
             // scan slightly fades the undriven rest of the panel — with the
             // cursor moving constantly, the board washed out. The full
             // refresh redraws everything crisp each time.
-            full_draw(&mut canvas, levels, &board, &ui, net.as_ref());
-            epd.set_speed(Speed::Turbo);
-            epd.present_levels(levels).await;
+            full_draw(&mut canvas, levels, &board, &ui, net.as_ref(), bat(&mut battery));
+            screen.set_slow(false);
+            screen.show(&canvas, levels).await;
         }
     }
 }
@@ -308,6 +501,93 @@ struct Ui {
     eval: Option<(f32, Option<i32>)>,
     thinking: bool,
     note: heapless::String<32>,
+}
+
+/// Engine strength per difficulty pick (chess-api depth, 1-18).
+const DEPTH_EASY: u32 = 4;
+const DEPTH_MEDIUM: u32 = 8;
+const DEPTH_HARD: u32 = 13;
+
+/// Draws the title card (doubles as the game-over screen).
+fn draw_title(canvas: &mut Grey<'_>, levels: &mut [u8]) {
+    canvas.fill(255);
+    let big = FontRenderer::new::<fonts::u8g2_font_logisoso32_tf>();
+    let small = FontRenderer::new::<fonts::u8g2_font_crox1h_tf>();
+    let cx = WIDTH as i32 / 2;
+    let cy = HEIGHT as i32 / 2;
+    let _ = big.render_aligned(
+        "Chess",
+        Point::new(cx, cy - 18),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(BLACK),
+        canvas,
+    );
+    let _ = small.render_aligned(
+        "press any button to start",
+        Point::new(cx, cy + 8),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(BLACK),
+        canvas,
+    );
+    let _ = small.render_aligned(
+        "A easy   B medium   C hard",
+        Point::new(cx, cy + 28),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(BLACK),
+        canvas,
+    );
+    dither::quantize(
+        canvas,
+        Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32)),
+        Dither::Nearest,
+        levels,
+    );
+}
+
+/// Shows the title card and waits for a button; returns the engine depth
+/// for the chosen difficulty (any non-letter button starts at medium).
+async fn title_screen(screen: &mut Screen, canvas: &mut Grey<'_>, levels: &mut [u8]) -> u32 {
+    draw_title(canvas, levels);
+    screen.set_slow(true);
+    screen.show(canvas, levels).await;
+    // Ignore presses queued before the card was up.
+    while EVENTS.try_receive().is_ok() {}
+    loop {
+        if let ButtonEvent::Pressed(b) = EVENTS.receive().await {
+            return match b {
+                Button::A => DEPTH_EASY,
+                Button::B => DEPTH_MEDIUM,
+                Button::C => DEPTH_HARD,
+                _ => DEPTH_MEDIUM,
+            };
+        }
+    }
+}
+
+/// Battery state for the corner gauge: `None` until a reading exists.
+fn bat(battery: &mut Battery) -> Option<(u8, bool)> {
+    #[cfg(feature = "badger")]
+    return Some((battery.percent(), battery.on_usb()));
+    #[cfg(feature = "tufty")]
+    return battery.percent().map(|p| (p, battery.on_usb()));
+}
+
+/// Parses a `WIFI <ssid> <password>` line (quote an ssid containing
+/// spaces; the password may contain spaces either way).
+fn parse_wifi(entered: &str) -> Option<(&str, &str)> {
+    let rest = entered
+        .split_at_checked(5)
+        .filter(|(head, _)| head.eq_ignore_ascii_case("WIFI "))
+        .map(|(_, rest)| rest.trim())?;
+    let parsed = if let Some(quoted) = rest.strip_prefix('"') {
+        quoted.split_once('"').map(|(ssid, rest)| (ssid, rest.trim_start()))
+    } else {
+        rest.split_once(' ')
+    };
+    parsed.map(|(ssid, pass)| (ssid.trim(), pass.trim()))
 }
 
 /// Splits the stored `ssid\0pass` credential blob.
@@ -442,6 +722,7 @@ async fn engine_move(
     tls_tx: &mut [u8],
     http_rx: &mut [u8],
     board: &Board,
+    depth: u32,
 ) -> Result<(Move, f32, Option<i32>), &'static str> {
     if !net.joined {
         return Err("no wifi");
@@ -460,7 +741,7 @@ async fn engine_move(
         }
         let _ = body.push_str(if i == 3 { "-" } else { field });
     }
-    let _ = body.push_str("\",\"depth\":12}");
+    let _ = write!(body, "\",\"depth\":{}}}", depth);
 
     let tcp = TcpClient::new(net.wifi.stack, tcp_state);
     let dns = DnsSocket::new(net.wifi.stack);
@@ -582,7 +863,7 @@ fn square_rect(sq: Square) -> Rectangle {
 }
 
 /// Draws everything into `levels` (board, cursor, side panel).
-fn full_draw(canvas: &mut Grey<'_>, levels: &mut [u8], board: &Board, ui: &Ui, net: Option<&Net>) {
+fn full_draw(canvas: &mut Grey<'_>, levels: &mut [u8], board: &Board, ui: &Ui, net: Option<&Net>, power: Option<(u8, bool)>) {
     canvas.fill(255);
     let pieces_font = FontRenderer::new::<fonts::u8g2_font_unifont_t_76>();
 
@@ -713,6 +994,11 @@ fn full_draw(canvas: &mut Grey<'_>, levels: &mut [u8], board: &Board, ui: &Ui, n
     }
     line(canvas, "B = select", &mut y);
     line(canvas, "hold B = new", &mut y);
+
+    // Battery gauge, bottom right.
+    if let Some((pct, on_usb)) = power {
+        draw_battery(canvas, Point::new(WIDTH as i32 - 30, HEIGHT as i32 - 17), pct, on_usb);
+    }
 
     dither::quantize(
         canvas,

@@ -81,8 +81,14 @@ pub fn power_off() -> ! {
     // Arm the wake sources (same channels as the stock firmware). Falling
     // edge, matching the active-low lines. Wait for each line to be idle
     // (high) first so a still-latched press does not wake us instantly.
-    wait_gpio_high(GPIO_RTC_ALARM);
-    wait_gpio_high(GPIO_SWITCH_INT);
+    // A line stuck low (e.g. an uncleared RTC alarm holding INT down)
+    // would make the armed edge unreachable — the badge would sleep
+    // unwakeable — so bail out to a clean reboot instead: the app's boot
+    // path clears the alarm and gets a fresh shot at sleeping.
+    if !wait_gpio_high(GPIO_RTC_ALARM) || !wait_gpio_high(GPIO_SWITCH_INT) {
+        log::warn!("power: wake line stuck low; rebooting instead of sleeping");
+        reboot_normal();
+    }
     arm_gpio_wakeup(1, GPIO_RTC_ALARM);
     arm_gpio_wakeup(3, GPIO_SWITCH_INT);
 
@@ -142,16 +148,16 @@ fn quiesce_gpio() {
 }
 
 /// Busy-waits (bounded) for a wake line to sit in its idle high state.
-fn wait_gpio_high(gpio: u8) {
+fn wait_gpio_high(gpio: u8) -> bool {
     let bank = usize::from(gpio) / 32;
     let mask = 1u32 << (usize::from(gpio) % 32);
-    // ~1 s at 150 MHz; matches the stock firmware's 1 s timeout, after which
-    // it arms anyway.
+    // ~1 s at 150 MHz; matches the stock firmware's 1 s timeout.
     for _ in 0..1_500_000u32 {
         if pac::SIO.gpio_in(bank).read() & mask != 0 {
-            return;
+            return true;
         }
     }
+    false
 }
 
 /// Arms one POWMAN GPIO wake channel for a falling edge (pico-sdk
@@ -188,23 +194,56 @@ fn arm_gpio_wakeup(channel: usize, gpio: u8) {
 fn enter_off() -> ! {
     let state = pac::POWMAN.state().as_ptr() as *mut u32;
 
-    let ignored = {
-        let mut m = State(0);
-        m.set_req_ignored(true);
-        m.0
-    };
-    pm_clear(state, ignored);
+    // POWMAN can ABANDON an off request: a wake edge landing while the
+    // sequencer is waiting sets PWRUP_WHILE_WAITING and leaves the chip
+    // running (observed in the field: one abandoned request stranded the
+    // badge awake, radio on, for half an hour — STATE read 0x200 over
+    // SWD). Retry a few times, clearing the abandonment flags and any
+    // freshly latched wake status; if it still will not go down, a clean
+    // reboot costs one extra wake cycle instead of the whole battery.
+    for attempt in 0..5u32 {
+        let flags = {
+            let mut m = State(0);
+            m.set_req_ignored(true);
+            m.set_pwrup_while_waiting(true);
+            m.0
+        };
+        pm_clear(state, flags);
 
-    // Request all four domains off (REQ field is active-low domain mask).
-    let req = {
-        let mut m = State(0);
-        m.set_req(0xf);
-        m.0
-    };
-    pm_write(state, req);
+        // Request all four domains off (REQ field is active-low domain mask).
+        let req = {
+            let mut m = State(0);
+            m.set_req(0xf);
+            m.0
+        };
+        pm_write(state, req);
 
+        // If the request lands, execution ends inside this delay.
+        cortex_m::asm::delay(15_000_000); // ~100 ms
+        log::warn!("power: off request abandoned (attempt {})", attempt + 1);
+
+        // A glitch re-latched a wake edge: clear channel status and retry.
+        for ch in [1usize, 3] {
+            let reg = pac::POWMAN.pwrup(ch).as_ptr() as *mut u32;
+            let status = {
+                let mut m = Pwrup(0);
+                m.set_status(true);
+                m.0
+            };
+            pm_clear(reg, status);
+        }
+    }
+    log::warn!("power: could not power off; rebooting");
+    reboot_normal();
+}
+
+/// Clean reboot into the normal boot path — the fallback whenever the
+/// power-off path cannot proceed safely.
+fn reboot_normal() -> ! {
+    // 0x0000 = REBOOT_TYPE_NORMAL, 100 ms delay.
+    embassy_rp::rom_data::reboot(0x0000, 100, 0, 0);
     loop {
-        cortex_m::asm::wfi();
+        cortex_m::asm::wfe();
     }
 }
 

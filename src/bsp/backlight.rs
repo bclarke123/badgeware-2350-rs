@@ -78,9 +78,16 @@ pub async fn backlight_task(mut backlight: Backlight) -> ! {
     }
 }
 
-/// Samples ambient light and publishes a matching backlight target.
+/// Samples ambient light and publishes a matching backlight target; also
+/// samples `VBAT_SENSE` (GPIO40, 2:1 divider) each tick and publishes the
+/// smoothed millivolts through [`crate::bsp::battery`], since this task
+/// owns the board's only ADC.
 #[embassy_executor::task]
-pub async fn auto_backlight_task(mut adc: Adc<'static, Async>, mut light: AdcChannel<'static>) -> ! {
+pub async fn auto_backlight_task(
+    mut adc: Adc<'static, Async>,
+    mut light: AdcChannel<'static>,
+    mut vbat: AdcChannel<'static>,
+) -> ! {
     // The phototransistor saturates the 12-bit ADC in bright light and reads
     // near zero in the dark. These bounds map that usable range onto a dim but
     // readable minimum and full brightness.
@@ -91,8 +98,14 @@ pub async fn auto_backlight_task(mut adc: Adc<'static, Async>, mut light: AdcCha
 
     let mut ticker = Ticker::every(Duration::from_millis(500));
     let mut smoothed: u32 = 0;
+    let mut vbat_smoothed: u32 = 0;
     loop {
         ticker.next().await;
+        if let Ok(raw) = adc.read(&mut vbat).await {
+            let mv = u32::from(raw) * 2 * 3300 / 4095;
+            vbat_smoothed = if vbat_smoothed == 0 { mv } else { (vbat_smoothed * 3 + mv) / 4 };
+            crate::bsp::battery::publish_vbat_mv(vbat_smoothed);
+        }
         let raw = match adc.read(&mut light).await {
             Ok(v) => v,
             Err(e) => {

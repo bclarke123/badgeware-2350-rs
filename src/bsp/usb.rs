@@ -133,6 +133,9 @@ pub async fn read_line(buf: &mut heapless::String<128>) -> &str {
         match b {
             b'\r' | b'\n' => {
                 if !buf.is_empty() {
+                    // Echo the completed line so typing into a quiet port
+                    // (screen's default) is verifiable.
+                    log::info!("> {}", buf.as_str());
                     return buf.trim();
                 }
             }
