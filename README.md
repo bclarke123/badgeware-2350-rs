@@ -44,8 +44,8 @@ blank = not a fit for the hardware):
 | `tree` | ✓ | ✓ | |
 | `epd_test` | | ✓ | |
 | `mono_test` | | | ✓ |
-| `badge` | | ✓ | ? |
-| `totp` | | ✓ | ? |
+| `badge` | | ✓ | ✓ |
+| `totp` | | ✓ | ✓ |
 | `weather` | ? | ✓ | ✓ |
 | `chess` | ✓ | ✓ | |
 | `marquee` | | ✓ | ? |

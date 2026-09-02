@@ -97,6 +97,14 @@ const SPEED_CLEAN: Speed = Speed::Slow;
 #[cfg(feature = "badger2040w")]
 const SPEED_CLEAN: Speed = Speed::Default;
 
+/// Waveform for a code change: the UC8151's Turbo ghosts hard on fresh
+/// digits, so new codes get the mid-tier Fast pass (~0.8 s); countdown
+/// ticks stay Turbo. (The SSD1680's Turbo is clean enough for both.)
+#[cfg(feature = "badger")]
+const SPEED_CODE: Speed = Speed::Turbo;
+#[cfg(feature = "badger2040w")]
+const SPEED_CODE: Speed = Speed::Fast;
+
 /// Quantizes the whole canvas for the panel at hand.
 fn quantize_full(canvas: &Grey<'_>, levels: &mut [u8]) {
     let full = Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32));
@@ -189,7 +197,7 @@ async fn main(spawner: Spawner) {
 
         draw_code(&mut canvas, levels, code, &now, remaining);
         let full = windows.is_multiple_of(FULL_EVERY);
-        epd.set_speed(if full { SPEED_CLEAN } else { Speed::Turbo });
+        epd.set_speed(if full { SPEED_CLEAN } else { SPEED_CODE });
         epd.present_levels(levels).await;
         windows += 1;
 
