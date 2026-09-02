@@ -22,18 +22,34 @@ worth mentioning.
 
 ## Examples
 
-| Example | Board | What it does |
-|---|---|---|
-| `simon` | tufty | The repo's original app: a Simon memory game on the five buttons — animated pads aligned with the physical controls, LED echoes, high score in the RTC's battery-backed byte. |
-| `tree` | both | Procedurally grown 3D tree garden: dual-core renderer, anti-aliased edges, SIO-interpolator textured sprites, perspective grass, day cycle. 60 fps on the Tufty. |
-| `epd_test` | badger | E-paper test card: the four panel greys, dither comparisons (Bayer 4×4/8×8, Floyd–Steinberg), supersampled text, live calibration on the buttons. |
-| `badge` | badger | Name badge driven by `examples/badge.vcf`: big name, social handles parsed from URLs (`GH: you`, `LI: you`), and a scannable vCard QR. |
-| `totp` | badger | Six-digit authenticator: battery-backed RTC, secret in flash, provisioning over USB serial, seven-segment digits with a draining 30 s bar. |
-| `weather` | badger, badger2040w | Ambient weather station: joins WiFi, geolocates by IP, fetches Open-Meteo, syncs the RTC from NTP, and refreshes every 15 min with condition icons and a battery gauge. |
-| `chess` | badger | Play White against Stockfish at chess-api.com over TLS 1.3. `cozy-chess` legal moves on five buttons, eval + captured pieces in the panel, game persisted across power-off. |
-| `marquee` | badger | Concert beacon: hold A and the badge becomes a hotspot with a join-QR; your phone's captive-portal sheet pops a form, and the message renders as big as it fits. No app, no shared network, no typed URLs. |
-| `reader` | badger | E-reader: streams a Project Gutenberg book over TLS into the 8 MB PSRAM (progress bar included), then pages it on the e-paper — word wrap, typography cleanup, persistent bookmark, page-up/-down from any point. |
-| `mono_test` | badger2040w | 1-bit test card for the Badger 2040 W: a grey ramp under selectable dithers, hairline/checker/disc swatches, all four UC8151 waveform speeds with measured times over serial, invert-to-check-ghosting. |
+| Example | What it does |
+|---|---|
+| `simon` | The repo's original app: a Simon memory game on the five buttons — animated pads aligned with the physical controls, LED echoes, high score in the RTC's battery-backed byte. |
+| `tree` | Procedurally grown 3D tree garden: dual-core renderer, anti-aliased edges, SIO-interpolator textured sprites, perspective grass, day cycle. 60 fps on the Tufty. |
+| `epd_test` | E-paper test card: the four panel greys, dither comparisons (Bayer 4×4/8×8, Floyd–Steinberg), supersampled text, live calibration on the buttons. |
+| `mono_test` | Its 1-bit cousin: a grey ramp under selectable dithers, hairline/checker/disc swatches, all four UC8151 waveform speeds with measured times over serial, invert-to-check-ghosting. |
+| `badge` | Name badge driven by `examples/badge.vcf`: big name, social handles parsed from URLs (`GH: you`, `LI: you`), and a scannable vCard QR. |
+| `totp` | Six-digit authenticator: battery-backed RTC, secret in flash, provisioning over USB serial, seven-segment digits with a draining 30 s bar. |
+| `weather` | Ambient weather station: joins WiFi, geolocates by IP, fetches Open-Meteo, syncs the RTC from NTP, and refreshes every 15 min with condition icons and a battery gauge. Wake-render-sleep on battery: weeks per charge. |
+| `chess` | Play White against Stockfish at chess-api.com over TLS 1.3. Title screen with three difficulties, `cozy-chess` legal moves on five buttons, eval + captured pieces in the panel, game persisted across power-off, battery gauge. |
+| `marquee` | Concert beacon: hold A and the badge becomes a hotspot with a join-QR; your phone's captive-portal sheet pops a form, and the message renders as big as it fits. No app, no shared network, no typed URLs. |
+| `reader` | E-reader: streams a Project Gutenberg book over TLS into the 8 MB PSRAM (progress bar included), then pages it on the e-paper — word wrap, typography cleanup, persistent bookmark, page-up/-down from any point. |
+
+Which example runs where (✓ = works today, ? = should port cleanly — hover
+for the caveat, blank = not a fit for the hardware):
+
+| Example | Tufty 2350 | Badger 2350 | Badger 2040 W |
+|---|:---:|:---:|:---:|
+| `simon` | ✓ | | |
+| `tree` | ✓ | ✓ | |
+| `epd_test` | | ✓ | |
+| `mono_test` | | | ✓ |
+| `badge` | | ✓ | <abbr title="Needs the 1-bit present path swapped in; layout fits.">?</abbr> |
+| `totp` | | ✓ | <abbr title="Straightforward port: same RTC, same flash store; needs the 1-bit present path.">?</abbr> |
+| `weather` | <abbr title="All the plumbing exists (radio, RTC, battery); needs an LCD present path and a reason to burn a backlight on ambient info.">?</abbr> | ✓ | ✓ |
+| `chess` | ✓ | ✓ | |
+| `marquee` | | ✓ | <abbr title="Portable, but the Blinky's LED matrix is this app's real destination.">?</abbr> |
+| `reader` | <abbr title="The Tufty has the same 8 MB PSRAM wired to QMI CS1, but it is untested there.">?</abbr> | ✓ | |
 
 ## Building & flashing (no debug probe needed)
 
