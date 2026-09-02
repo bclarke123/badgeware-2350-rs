@@ -227,8 +227,8 @@ fn enter_off() -> ! {
         unsafe {
             core::ptr::write_volatile(0xE000_E014 as *mut u32, 15_000_000); // RVR ~100 ms
             core::ptr::write_volatile(0xE000_E018 as *mut u32, 0); // CVR reset
-            core::ptr::write_volatile(0xE000_E010 as *mut u32, 0b111); // enable + tickint + core clock
-        }
+            core::ptr::write_volatile(0xE000_E010 as *mut u32, 0b111) // enable + tickint + core clock
+        };
         cortex_m::asm::wfi();
         log::warn!("power: off request abandoned (attempt {})", attempt + 1);
 
