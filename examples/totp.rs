@@ -1,12 +1,16 @@
-//! TOTP authenticator for the Badger 2350: six digits, big, on zero-power
-//! e-paper, refreshed every 30-second window.
+//! TOTP authenticator for the e-paper badges: six digits, big, on
+//! zero-power e-paper, refreshed every 30-second window.
 //!
 //! `cargo run --release --example totp --no-default-features --features badger`
+//! (or `--features badger2040w --target thumbv6m-none-eabi`)
 //!
 //! Time lives in the battery-backed PCF85063A RTC and the secret in the last
-//! flash sector, so both survive reflashing and power-off. If the RTC has
-//! lost power (first boot, drained battery) or no secret is stored, the
-//! badge shows a setup screen and listens on its USB serial port
+//! flash sector, so both survive reflashing and power-off. **Evergreen**: if
+//! the RTC loses power (battery swap, months in a drawer) and WiFi
+//! credentials are stored, the badge silently re-syncs its clock over NTP
+//! and carries on — the secret can outlive any number of dead batteries.
+//! Only with no stored credentials (or no secret yet) does it show the
+//! setup screen and listen on its USB serial port
 //! (`screen /dev/cu.usbmodem* 115200`) for two lines:
 //!
 //! ```text
@@ -23,7 +27,12 @@
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::USB;
-use embassy_rp::{bind_interrupts, usb};
+use embassy_net::dns::DnsQueryType;
+use embassy_net::udp::{PacketMetadata, UdpSocket};
+use embassy_net::{IpAddress, IpEndpoint};
+use embassy_rp::peripherals::PIO0;
+use embassy_rp::{bind_interrupts, dma, pio, usb};
+use embassy_time::with_timeout;
 use embassy_time::{Duration, Timer};
 use embedded_graphics::pixelcolor::Gray8;
 use embedded_graphics::prelude::*;
@@ -40,15 +49,20 @@ use tufty_2350::bsp::buttons::{Button, ButtonEvent, ButtonPins, EVENTS};
 use tufty_2350::bsp::epd::{Epd, Speed};
 #[cfg(feature = "badger2040w")]
 use tufty_2350::bsp::epd_mono::{Epd, Speed};
-use tufty_2350::bsp::leds::RearLeds;
+use tufty_2350::bsp::battery::Battery;
+use tufty_2350::bsp::leds::{LedCue, RearLeds};
+use tufty_2350::bsp::wifi;
 use tufty_2350::bsp::rtc::{DateTime, RtcRam};
 use tufty_2350::bsp::screen::{HEIGHT, WIDTH};
 use tufty_2350::bsp::settings::{Settings, MAX_VAL};
 use tufty_2350::gfx::dither::{self, Method};
 use tufty_2350::gfx::grey::Grey;
+use tufty_2350::gfx::widgets::draw_battery;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
+    PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
+    DMA_IRQ_0 => dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>;
 });
 
 static CANVAS: ConstStaticCell<[u8; WIDTH * HEIGHT]> = ConstStaticCell::new([0; WIDTH * HEIGHT]);
@@ -166,6 +180,11 @@ async fn main(spawner: Spawner) {
     let mut epd = Epd::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_17, p.PIN_20, p.PIN_21, p.PIN_26);
     epd.init().await;
 
+    #[cfg(feature = "badger")]
+    let mut battery = Battery::new(p.ADC, p.PIN_26, p.PIN_28, p.PIN_12);
+    #[cfg(feature = "badger2040w")]
+    let mut battery = Battery::sample(p.ADC.reborrow(), p.PIN_29.reborrow(), p.PIN_25.reborrow());
+
     let mut rtc = RtcRam::new(p.I2C0, p.PIN_5, p.PIN_4);
     let mut settings = Settings::new(p.FLASH);
 
@@ -180,13 +199,68 @@ async fn main(spawner: Spawner) {
         .and_then(|s| base32_decode(s, &mut key))
         .unwrap_or(0);
 
+    // ---- Evergreen clock: a lost RTC (battery swap, months in a drawer)
+    // recovers itself over NTP with the stored WiFi credentials — success
+    // clears the lost-power flag, failure falls through to serial setup.
+    if rtc.lost_power() {
+        let mut cred = [0u8; MAX_VAL];
+        let cred_len = settings.get("wifi", &mut cred).map(<[u8]>::len).unwrap_or(0);
+        if cred_len > 0 {
+            let (ssid, pass) = split_cred(&cred[..cred_len]);
+            log::info!("clock lost; recovering over NTP via '{}'", ssid);
+            bsp::leds::cue(LedCue::Breathe);
+            let dma_ch = dma::Channel::new(p.DMA_CH0, Irqs);
+            match wifi::connect(
+                spawner, p.PIO0, Irqs, dma_ch, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, ssid, pass,
+            )
+            .await
+            {
+                Ok(mut net) => {
+                    if let Ok(Some(unix)) =
+                        with_timeout(Duration::from_secs(45), sntp(net.stack)).await
+                    {
+                        set_rtc_from_unix(&mut rtc, unix);
+                    } else {
+                        log::warn!("ntp failed; falling back to serial setup");
+                    }
+                    net.leave().await;
+                }
+                Err(e) => log::warn!("wifi failed ({:?}); falling back to serial setup", e),
+            }
+            bsp::leds::cue(LedCue::Off);
+        }
+    }
+
+    // ---- The radio's work (if any) is done for the life of this boot.
+    // Cut its power and take the VSYS pins back for the ADC: GPIO29 (the
+    // sense pin) and GPIO25 (the divider's FET gate) belong to the radio
+    // SPI, but a powered-down CYW43 never speaks again — its runner task
+    // sleeps forever on a silent bus. This is what makes the battery gauge
+    // live instead of a stale boot sample.
+    // SAFETY: the radio, if started, has left the network and is powered
+    // off below; nothing touches these pins as SPI afterwards.
+    #[cfg(feature = "badger2040w")]
+    let (mut vsys_pin, mut vsys_gate) = unsafe {
+        let wl_on = Output::new(embassy_rp::peripherals::PIN_23::steal(), Level::Low);
+        core::mem::forget(wl_on);
+        (
+            embassy_rp::peripherals::PIN_29::steal(),
+            embassy_rp::peripherals::PIN_25::steal(),
+        )
+    };
+
     if rtc.lost_power() || key_len == 0 {
-        key_len = setup(&mut epd, &mut canvas, levels, &mut rtc, &mut settings, &mut key).await;
+        key_len = setup(&mut epd, &mut canvas, levels, &mut rtc, &mut settings, &mut key, key_len).await;
     }
 
     // ---- Show codes forever.
     let mut windows = 0u32;
     loop {
+        // Live gauge: the reclaimed VSYS pins are ours now.
+        #[cfg(feature = "badger2040w")]
+        {
+            battery = Battery::sample(p.ADC.reborrow(), vsys_pin.reborrow(), vsys_gate.reborrow());
+        }
         let Some(now) = rtc.read_datetime() else {
             Timer::after(Duration::from_secs(1)).await;
             continue;
@@ -195,7 +269,7 @@ async fn main(spawner: Spawner) {
         let code = totp(&key[..key_len], unix);
         let remaining = 30 - (unix % 30) as u32;
 
-        draw_code(&mut canvas, levels, code, &now, remaining);
+        draw_code(&mut canvas, levels, code, &now, remaining, (battery.percent(), battery.on_usb()));
         let full = windows.is_multiple_of(FULL_EVERY);
         epd.set_speed(if full { SPEED_CLEAN } else { SPEED_CODE });
         epd.present_levels(levels).await;
@@ -218,7 +292,7 @@ async fn main(spawner: Spawner) {
                     if u / 30 != window_id {
                         break; // next code
                     }
-                    draw_code(&mut canvas, levels, code, &t, 30 - (u % 30) as u32);
+                    draw_code(&mut canvas, levels, code, &t, 30 - (u % 30) as u32, (battery.percent(), battery.on_usb()));
                     epd.present_levels(levels).await;
                 }
                 embassy_futures::select::Either::Second(ButtonEvent::Pressed(Button::A)) => {
@@ -226,7 +300,8 @@ async fn main(spawner: Spawner) {
                     break;
                 }
                 embassy_futures::select::Either::Second(ButtonEvent::Pressed(Button::B)) => {
-                    key_len = setup(&mut epd, &mut canvas, levels, &mut rtc, &mut settings, &mut key).await;
+                    // Deliberate re-provision: require a fresh secret.
+                    key_len = setup(&mut epd, &mut canvas, levels, &mut rtc, &mut settings, &mut key, 0).await;
                     windows = 0;
                     break;
                 }
@@ -271,6 +346,7 @@ async fn setup(
     rtc: &mut RtcRam,
     settings: &mut Settings,
     key: &mut [u8; 40],
+    existing_key_len: usize,
 ) -> usize {
     draw_setup(canvas, levels, rtc.lost_power(), false);
     epd.set_speed(SPEED_CLEAN);
@@ -278,7 +354,9 @@ async fn setup(
     log::info!("setup: send `TIME 2026-08-30T21:04:05` (UTC) and `SECRET <base32>`");
 
     let mut time_ok = !rtc.lost_power();
-    let mut key_len = 0usize;
+    // The stored secret survives power loss in flash: after a battery swap
+    // only the clock needs re-entering.
+    let mut key_len = existing_key_len;
     let mut line = heapless::String::<128>::new();
     loop {
         if time_ok && key_len > 0 {
@@ -386,7 +464,7 @@ fn totp(key: &[u8], unix: u64) -> u32 {
 
 /// The main screen: seven-segment digits, the UTC time small, and the
 /// countdown bar (painted separately so partial ticks reuse the code).
-fn draw_code(canvas: &mut Grey<'_>, levels: &mut [u8], code: u32, now: &DateTime, remaining: u32) {
+fn draw_code(canvas: &mut Grey<'_>, levels: &mut [u8], code: u32, now: &DateTime, remaining: u32, (batt_pct, on_usb): (u8, bool)) {
     canvas.fill(255);
     let digits = FontRenderer::new::<fonts::u8g2_font_7Segments_26x42_mn>();
     let mut text = heapless::String::<8>::new();
@@ -411,6 +489,19 @@ fn draw_code(canvas: &mut Grey<'_>, levels: &mut [u8], code: u32, now: &DateTime
         Point::new((BAR_X0 - 6) / 2, CLOCK_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
+        FontColor::Transparent(BLACK),
+        canvas,
+    );
+
+    // Battery bottom-left.
+    draw_battery(canvas, Point::new(6, HEIGHT as i32 - 17), batt_pct, on_usb);
+    let mut pct = heapless::String::<8>::new();
+    let _ = core::fmt::write(&mut pct, format_args!("{}%", batt_pct));
+    let _ = small.render_aligned(
+        pct.as_str(),
+        Point::new(34, HEIGHT as i32 - 6),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Left,
         FontColor::Transparent(BLACK),
         canvas,
     );
@@ -457,6 +548,63 @@ fn draw_setup(canvas: &mut Grey<'_>, levels: &mut [u8], need_time: bool, done: b
         y += SETUP_STEP;
     }
     quantize_full(canvas, levels);
+}
+
+/// Splits the stored `ssid\0pass` credential blob.
+fn split_cred(cred: &[u8]) -> (&str, &str) {
+    let split = cred.iter().position(|&b| b == 0).unwrap_or(cred.len());
+    (
+        core::str::from_utf8(&cred[..split]).unwrap_or(""),
+        core::str::from_utf8(cred.get(split + 1..).unwrap_or(&[])).unwrap_or(""),
+    )
+}
+
+/// One SNTP exchange with pool.ntp.org; returns Unix seconds.
+async fn sntp(stack: embassy_net::Stack<'static>) -> Option<u64> {
+    let server = resolve(stack, "pool.ntp.org").await?;
+    let mut rx_meta = [PacketMetadata::EMPTY; 4];
+    let mut tx_meta = [PacketMetadata::EMPTY; 4];
+    let mut rx = [0u8; 128];
+    let mut tx = [0u8; 128];
+    let mut sock = UdpSocket::new(stack, &mut rx_meta, &mut rx, &mut tx_meta, &mut tx);
+    sock.bind(0).ok()?;
+    let mut packet = [0u8; 48];
+    packet[0] = 0x1B; // LI=0, VN=3, mode=client
+    let endpoint = IpEndpoint::new(server, 123);
+    sock.send_to(&packet, endpoint).await.ok()?;
+    let mut reply = [0u8; 48];
+    let (n, _) = with_timeout(Duration::from_secs(5), sock.recv_from(&mut reply)).await.ok()?.ok()?;
+    if n < 44 {
+        return None;
+    }
+    let secs = u32::from_be_bytes(reply[40..44].try_into().ok()?);
+    // NTP epoch (1900) to Unix epoch (1970).
+    Some(u64::from(secs) - 2_208_988_800)
+}
+
+/// DNS A lookup.
+async fn resolve(stack: embassy_net::Stack<'static>, host: &str) -> Option<IpAddress> {
+    let addrs = with_timeout(Duration::from_secs(10), stack.dns_query(host, DnsQueryType::A))
+        .await
+        .ok()?
+        .ok()?;
+    addrs.first().copied()
+}
+
+/// Writes a Unix timestamp into the RTC as UTC.
+fn set_rtc_from_unix(rtc: &mut RtcRam, unix: u64) {
+    let dt = DateTime::from_unix(unix);
+    if rtc.set_datetime(&dt) {
+        log::info!(
+            "rtc set from ntp: {:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+            dt.year,
+            dt.month,
+            dt.day,
+            dt.hour,
+            dt.minute,
+            dt.second
+        );
+    }
 }
 
 // Rust guideline compliant 2026-08-30
