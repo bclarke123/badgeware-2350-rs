@@ -73,11 +73,11 @@ required-features = ["badger2040w"]
 
 [[example]]
 name = "badge"
-required-features = ["badger"]
+required-features = ["_epaper"]
 
 [[example]]
 name = "totp"
-required-features = ["badger"]
+required-features = ["_epaper"]
 
 [[example]]
 name = "weather"

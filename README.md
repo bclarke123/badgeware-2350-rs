@@ -35,8 +35,8 @@ worth mentioning.
 | `marquee` | Concert beacon: hold A and the badge becomes a hotspot with a join-QR; your phone's captive-portal sheet pops a form, and the message renders as big as it fits. No app, no shared network, no typed URLs. |
 | `reader` | E-reader: streams a Project Gutenberg book over TLS into the 8 MB PSRAM (progress bar included), then pages it on the e-paper — word wrap, typography cleanup, persistent bookmark, page-up/-down from any point. |
 
-Which example runs where (✓ = works today, ? = should port cleanly — hover
-for the caveat, blank = not a fit for the hardware):
+Which example runs where (✓ = works today, ? = should port cleanly,
+blank = not a fit for the hardware):
 
 | Example | Tufty 2350 | Badger 2350 | Badger 2040 W |
 |---|:---:|:---:|:---:|
@@ -44,12 +44,12 @@ for the caveat, blank = not a fit for the hardware):
 | `tree` | ✓ | ✓ | |
 | `epd_test` | | ✓ | |
 | `mono_test` | | | ✓ |
-| `badge` | | ✓ | <abbr title="Needs the 1-bit present path swapped in; layout fits.">?</abbr> |
-| `totp` | | ✓ | <abbr title="Straightforward port: same RTC, same flash store; needs the 1-bit present path.">?</abbr> |
-| `weather` | <abbr title="All the plumbing exists (radio, RTC, battery); needs an LCD present path and a reason to burn a backlight on ambient info.">?</abbr> | ✓ | ✓ |
+| `badge` | | ✓ | ? |
+| `totp` | | ✓ | ? |
+| `weather` | ? | ✓ | ✓ |
 | `chess` | ✓ | ✓ | |
-| `marquee` | | ✓ | <abbr title="Portable, but the Blinky's LED matrix is this app's real destination.">?</abbr> |
-| `reader` | <abbr title="The Tufty has the same 8 MB PSRAM wired to QMI CS1, but it is untested there.">?</abbr> | ✓ | |
+| `marquee` | | ✓ | ? |
+| `reader` | ? | ✓ | |
 
 ## Building & flashing (no debug probe needed)
 

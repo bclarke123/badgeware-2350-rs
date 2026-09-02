@@ -36,7 +36,10 @@ use u8g2_fonts::{fonts, FontRenderer};
 
 use tufty_2350::bsp;
 use tufty_2350::bsp::buttons::{Button, ButtonEvent, ButtonPins, EVENTS};
+#[cfg(feature = "badger")]
 use tufty_2350::bsp::epd::{Epd, Speed};
+#[cfg(feature = "badger2040w")]
+use tufty_2350::bsp::epd_mono::{Epd, Speed};
 use tufty_2350::bsp::leds::RearLeds;
 use tufty_2350::bsp::rtc::{DateTime, RtcRam};
 use tufty_2350::bsp::screen::{HEIGHT, WIDTH};
@@ -59,16 +62,59 @@ const FULL_EVERY: u32 = 20;
 /// The countdown bar: a vertical strip on the right edge, draining downward.
 /// Vertical because the panel's partial-refresh axis is our horizontal one —
 /// this whole strip re-scans alone in a fraction of a TURBO refresh.
-const BAR_X0: i32 = 246;
-const BAR_X1: i32 = 258;
-const BAR_Y0: i32 = 16;
-const BAR_Y1: i32 = 160;
+#[cfg(feature = "badger")]
+mod layout {
+    pub const BAR_X0: i32 = 246;
+    pub const BAR_X1: i32 = 258;
+    pub const BAR_Y0: i32 = 16;
+    pub const BAR_Y1: i32 = 160;
+    pub const DIGITS_Y: i32 = 110;
+    pub const CLOCK_Y: i32 = 30;
+    pub const SETUP_TITLE_Y: i32 = 40;
+    pub const SETUP_BODY_Y0: i32 = 76;
+    pub const SETUP_STEP: i32 = 18;
+    /// The level value that renders as paper-white.
+    pub const WHITE: u8 = 3;
+}
+#[cfg(feature = "badger2040w")]
+mod layout {
+    pub const BAR_X0: i32 = 278;
+    pub const BAR_X1: i32 = 290;
+    pub const BAR_Y0: i32 = 12;
+    pub const BAR_Y1: i32 = 116;
+    pub const DIGITS_Y: i32 = 84;
+    pub const CLOCK_Y: i32 = 22;
+    pub const SETUP_TITLE_Y: i32 = 28;
+    pub const SETUP_BODY_Y0: i32 = 48;
+    pub const SETUP_STEP: i32 = 15;
+    pub const WHITE: u8 = 1;
+}
+use layout::*;
+
+/// Clean-refresh waveform (the fast one is Turbo on both panels).
+#[cfg(feature = "badger")]
+const SPEED_CLEAN: Speed = Speed::Slow;
+#[cfg(feature = "badger2040w")]
+const SPEED_CLEAN: Speed = Speed::Default;
+
+/// Quantizes the whole canvas for the panel at hand.
+fn quantize_full(canvas: &Grey<'_>, levels: &mut [u8]) {
+    let full = Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32));
+    #[cfg(feature = "badger")]
+    dither::quantize(canvas, full, Method::Nearest, levels);
+    #[cfg(feature = "badger2040w")]
+    dither::quantize_mono(canvas, full, Method::Nearest, levels);
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let mut p = embassy_rp::init(Default::default());
+    #[cfg(feature = "badger")]
     let power_en = Output::new(p.PIN_27, Level::High);
+    #[cfg(feature = "badger2040w")]
+    let power_en = Output::new(p.PIN_10, Level::High);
     core::mem::forget(power_en);
+    #[cfg(feature = "badger")]
     bsp::power::sleep_if_reset_held(
         p.PIN_14.reborrow(),
         p.PIN_0.reborrow(),
@@ -82,8 +128,12 @@ async fn main(spawner: Spawner) {
     spawner.spawn(bsp::usb::logger_task_with_input(usb_driver).unwrap());
     log::info!("totp booting");
 
+    #[cfg(feature = "badger")]
     let leds = RearLeds::new(p.PWM_SLICE0, p.PWM_SLICE1, p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3);
+    #[cfg(feature = "badger2040w")]
+    let leds = RearLeds::new(p.PWM_SLICE3, p.PIN_22);
     spawner.spawn(bsp::leds::led_task(leds).unwrap());
+    #[cfg(feature = "badger")]
     let buttons = ButtonPins {
         a: Input::new(p.PIN_7, Pull::Up),
         b: Input::new(p.PIN_9, Pull::Up),
@@ -92,9 +142,20 @@ async fn main(spawner: Spawner) {
         down: Input::new(p.PIN_6, Pull::Up),
         home: Input::new(p.PIN_22, Pull::Up),
     };
+    #[cfg(feature = "badger2040w")]
+    let buttons = ButtonPins {
+        a: Input::new(p.PIN_12, Pull::Down),
+        b: Input::new(p.PIN_13, Pull::Down),
+        c: Input::new(p.PIN_14, Pull::Down),
+        up: Input::new(p.PIN_15, Pull::Down),
+        down: Input::new(p.PIN_11, Pull::Down),
+    };
     spawner.spawn(bsp::buttons::button_task(buttons).unwrap());
 
+    #[cfg(feature = "badger")]
     let mut epd = Epd::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_17, p.PIN_20, p.PIN_21, p.PIN_16);
+    #[cfg(feature = "badger2040w")]
+    let mut epd = Epd::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_17, p.PIN_20, p.PIN_21, p.PIN_26);
     epd.init().await;
 
     let mut rtc = RtcRam::new(p.I2C0, p.PIN_5, p.PIN_4);
@@ -128,7 +189,7 @@ async fn main(spawner: Spawner) {
 
         draw_code(&mut canvas, levels, code, &now, remaining);
         let full = windows.is_multiple_of(FULL_EVERY);
-        epd.set_speed(if full { Speed::Slow } else { Speed::Turbo });
+        epd.set_speed(if full { SPEED_CLEAN } else { Speed::Turbo });
         epd.present_levels(levels).await;
         windows += 1;
 
@@ -174,7 +235,7 @@ fn paint_bar(levels: &mut [u8], remaining: u32) {
         Rectangle::new(Point::new(x, y), Size::new(w.max(0) as u32, h.max(0) as u32))
     };
     // Clear the strip, outline, fill.
-    dither::paint_level(levels, WIDTH, rect(BAR_X0 - 2, BAR_Y0 - 2, BAR_X1 - BAR_X0 + 4, BAR_Y1 - BAR_Y0 + 4), 3);
+    dither::paint_level(levels, WIDTH, rect(BAR_X0 - 2, BAR_Y0 - 2, BAR_X1 - BAR_X0 + 4, BAR_Y1 - BAR_Y0 + 4), WHITE);
     for (x0, y0, w, h) in [
         (BAR_X0, BAR_Y0, BAR_X1 - BAR_X0, 1),
         (BAR_X0, BAR_Y1 - 1, BAR_X1 - BAR_X0, 1),
@@ -204,7 +265,7 @@ async fn setup(
     key: &mut [u8; 40],
 ) -> usize {
     draw_setup(canvas, levels, rtc.lost_power(), false);
-    epd.set_speed(Speed::Slow);
+    epd.set_speed(SPEED_CLEAN);
     epd.present_levels(levels).await;
     log::info!("setup: send `TIME 2026-08-30T21:04:05` (UTC) and `SECRET <base32>`");
 
@@ -324,7 +385,7 @@ fn draw_code(canvas: &mut Grey<'_>, levels: &mut [u8], code: u32, now: &DateTime
     let _ = core::fmt::write(&mut text, format_args!("{:03} {:03}", code / 1000, code % 1000));
     let _ = digits.render_aligned(
         text.as_str(),
-        Point::new((BAR_X0 - 6) / 2, 110),
+        Point::new((BAR_X0 - 6) / 2, DIGITS_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
         FontColor::Transparent(BLACK),
@@ -339,19 +400,14 @@ fn draw_code(canvas: &mut Grey<'_>, levels: &mut [u8], code: u32, now: &DateTime
     );
     let _ = small.render_aligned(
         clock.as_str(),
-        Point::new((BAR_X0 - 6) / 2, 30),
+        Point::new((BAR_X0 - 6) / 2, CLOCK_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
         FontColor::Transparent(BLACK),
         canvas,
     );
 
-    dither::quantize(
-        canvas,
-        Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32)),
-        Method::Nearest,
-        levels,
-    );
+    quantize_full(canvas, levels);
     paint_bar(levels, remaining);
 }
 
@@ -362,7 +418,7 @@ fn draw_setup(canvas: &mut Grey<'_>, levels: &mut [u8], need_time: bool, done: b
     let body = FontRenderer::new::<fonts::u8g2_font_crox1h_tf>();
     let _ = title.render_aligned(
         if done { "Ready" } else { "TOTP setup" },
-        Point::new(WIDTH as i32 / 2, 40),
+        Point::new(WIDTH as i32 / 2, SETUP_TITLE_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
         FontColor::Transparent(BLACK),
@@ -380,7 +436,7 @@ fn draw_setup(canvas: &mut Grey<'_>, levels: &mut [u8], need_time: bool, done: b
     } else {
         &["Clock is set. Send over USB serial:", "", "SECRET JBSWY3DPEHPK3PXP    (base32)"]
     };
-    let mut y = 76;
+    let mut y = SETUP_BODY_Y0;
     for l in lines {
         let _ = body.render_aligned(
             *l,
@@ -390,14 +446,9 @@ fn draw_setup(canvas: &mut Grey<'_>, levels: &mut [u8], need_time: bool, done: b
             FontColor::Transparent(BLACK),
             canvas,
         );
-        y += 18;
+        y += SETUP_STEP;
     }
-    dither::quantize(
-        canvas,
-        Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32)),
-        Method::Nearest,
-        levels,
-    );
+    quantize_full(canvas, levels);
 }
 
 // Rust guideline compliant 2026-08-30

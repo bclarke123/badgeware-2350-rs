@@ -207,7 +207,8 @@ async fn main(spawner: Spawner) {
 
     let adc = adc::Adc::new(p.ADC, Irqs, adc::Config::default());
     let light = adc::Channel::new_pin(p.PIN_43, Pull::None);
-    spawner.spawn(bsp::backlight::auto_backlight_task(adc, light).unwrap());
+    let vbat = adc::Channel::new_pin(p.PIN_40, Pull::None);
+    spawner.spawn(bsp::backlight::auto_backlight_task(adc, light, vbat).unwrap());
 
     let frame = FrameBuffer::new(FRAMEBUFFER.take());
     display.present(frame.bytes()).await;

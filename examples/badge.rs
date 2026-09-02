@@ -52,7 +52,10 @@ use u8g2_fonts::{fonts, FontRenderer};
 
 use tufty_2350::bsp;
 use tufty_2350::bsp::buttons::{Button, ButtonEvent, ButtonPins, EVENTS};
+#[cfg(feature = "badger")]
 use tufty_2350::bsp::epd::{Epd, Speed};
+#[cfg(feature = "badger2040w")]
+use tufty_2350::bsp::epd_mono::{Epd, Speed};
 use tufty_2350::bsp::leds::RearLeds;
 use tufty_2350::bsp::screen::{HEIGHT, WIDTH};
 use tufty_2350::gfx::dither::{self, Method};
@@ -61,6 +64,46 @@ use tufty_2350::gfx::grey::Grey;
 /// The vCard: encoded in the QR verbatim, and the source of the displayed
 /// name (`FN:`) and email (`EMAIL`).
 const VCARD: &str = include_str!("badge.vcf");
+
+// Per-panel layout metrics (the 2040 W is wider and 48 px shorter).
+#[cfg(feature = "badger")]
+mod layout {
+    pub const NAME_Y: i32 = 36;
+    pub const RULE_Y: i32 = 48;
+    pub const SOC_Y0: i32 = 66;
+    pub const SOC_MAX_Y: i32 = 144;
+    pub const QR_TOP: i32 = 56;
+    pub const QR_BOT: i32 = 0;
+    pub const FOOT1_Y: i32 = 156;
+    pub const FOOT2_Y: i32 = 168;
+    pub const BOARD: &str = "Badger 2350";
+    /// The level value that renders as paper-white.
+    pub const WHITE: u8 = 3;
+}
+#[cfg(feature = "badger2040w")]
+mod layout {
+    pub const NAME_Y: i32 = 24;
+    pub const RULE_Y: i32 = 34;
+    pub const SOC_Y0: i32 = 50;
+    pub const SOC_MAX_Y: i32 = 104;
+    // Full panel height: on this short panel the QR outranks the rule.
+    pub const QR_TOP: i32 = 4;
+    pub const QR_BOT: i32 = 4;
+    pub const FOOT1_Y: i32 = 112;
+    pub const FOOT2_Y: i32 = 124;
+    pub const BOARD: &str = "Badger 2040 W";
+    pub const WHITE: u8 = 1;
+}
+use layout::*;
+
+/// Quantizes the whole canvas for the panel at hand.
+fn quantize_full(canvas: &Grey<'_>, levels: &mut [u8]) {
+    let full = Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32));
+    #[cfg(feature = "badger")]
+    dither::quantize(canvas, full, Method::Nearest, levels);
+    #[cfg(feature = "badger2040w")]
+    dither::quantize_mono(canvas, full, Method::Nearest, levels);
+}
 
 /// The values of every line starting with `key` (parameters like
 /// `;TYPE=github` are skipped along with the `:`), trimmed and non-empty.
@@ -134,8 +177,12 @@ const BLACK: Gray8 = Gray8::new(0);
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let mut p = embassy_rp::init(Default::default());
+    #[cfg(feature = "badger")]
     let power_en = Output::new(p.PIN_27, Level::High);
+    #[cfg(feature = "badger2040w")]
+    let power_en = Output::new(p.PIN_10, Level::High);
     core::mem::forget(power_en);
+    #[cfg(feature = "badger")]
     bsp::power::sleep_if_reset_held(
         p.PIN_14.reborrow(),
         p.PIN_0.reborrow(),
@@ -149,8 +196,12 @@ async fn main(spawner: Spawner) {
     spawner.spawn(bsp::usb::logger_task(usb_driver).unwrap());
     log::info!("badge booting");
 
+    #[cfg(feature = "badger")]
     let leds = RearLeds::new(p.PWM_SLICE0, p.PWM_SLICE1, p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3);
+    #[cfg(feature = "badger2040w")]
+    let leds = RearLeds::new(p.PWM_SLICE3, p.PIN_22);
     spawner.spawn(bsp::leds::led_task(leds).unwrap());
+    #[cfg(feature = "badger")]
     let buttons = ButtonPins {
         a: Input::new(p.PIN_7, Pull::Up),
         b: Input::new(p.PIN_9, Pull::Up),
@@ -159,9 +210,20 @@ async fn main(spawner: Spawner) {
         down: Input::new(p.PIN_6, Pull::Up),
         home: Input::new(p.PIN_22, Pull::Up),
     };
+    #[cfg(feature = "badger2040w")]
+    let buttons = ButtonPins {
+        a: Input::new(p.PIN_12, Pull::Down),
+        b: Input::new(p.PIN_13, Pull::Down),
+        c: Input::new(p.PIN_14, Pull::Down),
+        up: Input::new(p.PIN_15, Pull::Down),
+        down: Input::new(p.PIN_11, Pull::Down),
+    };
     spawner.spawn(bsp::buttons::button_task(buttons).unwrap());
 
+    #[cfg(feature = "badger")]
     let mut epd = Epd::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_17, p.PIN_20, p.PIN_21, p.PIN_16);
+    #[cfg(feature = "badger2040w")]
+    let mut epd = Epd::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_17, p.PIN_20, p.PIN_21, p.PIN_26);
     epd.init().await;
 
     let levels = LEVELS.take();
@@ -169,7 +231,10 @@ async fn main(spawner: Spawner) {
     let (qr_temp, qr_out) = (QR_TEMP.take(), QR_OUT.take());
     draw_badge(&mut canvas, levels, qr_temp, qr_out);
 
+    #[cfg(feature = "badger")]
     epd.set_speed(Speed::Slow);
+    #[cfg(feature = "badger2040w")]
+    epd.set_speed(Speed::Default);
     epd.present_levels(levels).await;
     log::info!("badge shown; A = refresh");
 
@@ -186,7 +251,7 @@ async fn main(spawner: Spawner) {
 /// working storage).
 fn draw_badge(canvas: &mut Grey<'_>, levels: &mut [u8], qr_temp: &mut [u8], qr_out: &mut [u8]) {
     let w = WIDTH as i32;
-    levels.fill(3);
+    levels.fill(WHITE);
     canvas.fill(255);
 
     // ---- QR first: its geometry sets the text column's right edge.
@@ -208,24 +273,24 @@ fn draw_badge(canvas: &mut Grey<'_>, levels: &mut [u8], qr_temp: &mut [u8], qr_o
     // the rule goes to modules. Integer scale: 3 px/module up to version 5
     // (a ~106-byte vCard); longer payloads drop to 2 and shrink — keep the
     // link list short if scanning matters.
-    let avail = HEIGHT as i32 - 56;
+    let avail = HEIGHT as i32 - QR_TOP - QR_BOT;
     let scale = (avail / size).max(1);
     let px = size * scale;
     let x0 = w - px - 6;
     let qr_x0 = x0;
-    let y0 = 56 + (avail - px) / 2;
+    let y0 = QR_TOP + (avail - px) / 2;
     // ---- Text, all 1:1 in real faces, quantized without dither.
     let name = FontRenderer::new::<fonts::u8g2_font_crox5hb_tf>();
     let _ = name.render_aligned(
         vcard_field(VCARD, "FN"),
-        Point::new(6, 36),
+        Point::new(6, NAME_Y),
         VerticalPosition::Baseline,
         HorizontalAlignment::Left,
         FontColor::Transparent(BLACK),
         canvas,
     );
     let small_face = FontRenderer::new::<fonts::u8g2_font_crox1h_tf>();
-    let mut y = 66;
+    let mut y = SOC_Y0;
     // Email, then every URL / X-SOCIALPROFILE line as a short social label,
     // until we run out of column. Lines are truncated to stay clear of the
     // QR (~8 px per character in this face).
@@ -235,7 +300,7 @@ fn draw_badge(canvas: &mut Grey<'_>, levels: &mut [u8], qr_temp: &mut [u8], qr_o
     let mut email_line = heapless::String::<48>::new();
     let _ = email_line.push_str(email);
     for text in core::iter::once(email_line).chain(links.map(social_display)) {
-        if y > 144 {
+        if y > SOC_MAX_Y {
             break;
         }
         let clipped = &text[..text.len().min(max_chars)];
@@ -250,17 +315,17 @@ fn draw_badge(canvas: &mut Grey<'_>, levels: &mut [u8], qr_temp: &mut [u8], qr_o
         y += 14;
     }
     let small = MonoTextStyle::new(&FONT_6X10, BLACK);
-    let _ = Line::new(Point::new(6, 48), Point::new(w - 6, 48))
+    #[cfg(feature = "badger")]
+    let rule_end = w - 6;
+    // The full-height QR owns the right edge; stop the rule short of it.
+    #[cfg(feature = "badger2040w")]
+    let rule_end = qr_x0 - 8;
+    let _ = Line::new(Point::new(6, RULE_Y), Point::new(rule_end, RULE_Y))
         .into_styled(PrimitiveStyle::with_stroke(BLACK, 1))
         .draw(canvas);
-    let _ = Text::new("Badger 2350", Point::new(6, 156), small).draw(canvas);
-    let _ = Text::new("embassy-rs", Point::new(6, 168), small).draw(canvas);
-    dither::quantize(
-        canvas,
-        Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32)),
-        Method::Nearest,
-        levels,
-    );
+    let _ = Text::new(BOARD, Point::new(6, FOOT1_Y), small).draw(canvas);
+    let _ = Text::new("embassy-rs", Point::new(6, FOOT2_Y), small).draw(canvas);
+    quantize_full(canvas, levels);
 
     // ---- Paint the QR modules last (directly as levels, over the quantized
     // white background): pure black on white, no dither.
