@@ -18,8 +18,14 @@
 //! SECRET JBSWY3DPEHPK3PXP      (base32, from the QR/setup key)
 //! ```
 //!
-//! **A** forces a clean SLOW refresh; **B** re-enters setup. HOME held 2 s
-//! reboots to BOOTSEL.
+//! On the 2040 W on battery, the app duty-cycles: each 5 s countdown tick
+//! is a whole boot — draw, refresh, arm the RTC alarm, power off — so the
+//! CPU is awake well under a second in every five. On USB it stays
+//! resident and ticks live.
+//!
+//! **A** forces a clean SLOW refresh; **B** re-enters setup (on the
+//! 2040 W the press itself wakes the board — hold it ~1 s so the fresh
+//! boot sees it). HOME held 2 s reboots to BOOTSEL.
 
 #![no_std]
 #![no_main]
@@ -132,10 +138,15 @@ fn quantize_full(canvas: &Grey<'_>, levels: &mut [u8]) {
 async fn main(spawner: Spawner) {
     let mut p = embassy_rp::init(Default::default());
     #[cfg(feature = "badger")]
-    let power_en = Output::new(p.PIN_27, Level::High);
+    {
+        let power_en = Output::new(p.PIN_27, Level::High);
+        core::mem::forget(power_en)
+    };
+    // The 2040 W's EN_3V3 latch stays in hand: dropping it is how the
+    // hybrid duty cycle powers off between countdown ticks (see the main
+    // loop). The RTC alarm re-latches it for the next tick.
     #[cfg(feature = "badger2040w")]
-    let power_en = Output::new(p.PIN_10, Level::High);
-    core::mem::forget(power_en);
+    let mut power_latch = Output::new(p.PIN_10, Level::High);
     #[cfg(feature = "badger")]
     bsp::power::sleep_if_reset_held(
         p.PIN_14.reborrow(),
@@ -172,6 +183,11 @@ async fn main(spawner: Spawner) {
         up: Input::new(p.PIN_15, Pull::Down),
         down: Input::new(p.PIN_11, Pull::Down),
     };
+    // On the 2040 W a front button both wakes the board and is released
+    // long before the button task could see it — so sample A/B levels here,
+    // while the press that booted us is (maybe) still held.
+    #[cfg(feature = "badger2040w")]
+    let (a_held, b_held) = (buttons.a.is_high(), buttons.b.is_high());
     spawner.spawn(bsp::buttons::button_task(buttons).unwrap());
 
     #[cfg(feature = "badger")]
@@ -182,10 +198,10 @@ async fn main(spawner: Spawner) {
 
     #[cfg(feature = "badger")]
     let mut battery = Battery::new(p.ADC, p.PIN_26, p.PIN_28, p.PIN_12);
-    #[cfg(feature = "badger2040w")]
-    let mut battery = Battery::sample(p.ADC.reborrow(), p.PIN_29.reborrow(), p.PIN_25.reborrow());
 
     let mut rtc = RtcRam::new(p.I2C0, p.PIN_5, p.PIN_4);
+    // A fired alarm (the wake that booted us) holds INT low until cleared.
+    rtc.clear_alarm();
     let mut settings = Settings::new(p.FLASH);
 
     let levels = LEVELS.take();
@@ -252,15 +268,36 @@ async fn main(spawner: Spawner) {
     if rtc.lost_power() || key_len == 0 {
         key_len = setup(&mut epd, &mut canvas, levels, &mut rtc, &mut settings, &mut key, key_len).await;
     }
+    #[cfg(feature = "badger2040w")]
+    if b_held {
+        // Deliberate re-provision (B held while waking): fresh secret.
+        log::info!("B held at boot: entering setup");
+        key_len = setup(&mut epd, &mut canvas, levels, &mut rtc, &mut settings, &mut key, 0).await;
+    }
 
-    // ---- Show codes forever.
-    let mut windows = 0u32;
+    // ---- Show codes forever: one pass per countdown tick (5 s).
+    //
+    // Everything a pass needs derives from the clock alone — the code from
+    // the 30 s window, the waveform from where in the window we are (first
+    // tick: the mid-tier code speed; every FULL_EVERY-th window: a full
+    // clean pass; plain ticks: Turbo). No cross-boot state, which matters
+    // because on the 2040 W on battery each pass IS a boot: draw, refresh,
+    // arm the RTC alarm for the next tick and drop the power latch —
+    // ~0.5 s awake out of every 5 instead of an always-on CPU. Full
+    // refreshes rather than partials each tick: a partial only re-scans the
+    // bar's columns, but every update still wiggles the whole panel's
+    // source lines, so undriven pixels fade a little per pass — the full
+    // refresh restores the digits each tick instead. On USB (or the 2350
+    // badger, whose idle draw is negligible) the loop stays resident and
+    // ticks on a timer, watching buttons.
+    #[cfg(feature = "badger")]
+    let mut force_clean = false;
+    #[cfg(feature = "badger2040w")]
+    let mut force_clean = a_held;
     loop {
         // Live gauge: the reclaimed VSYS pins are ours now.
         #[cfg(feature = "badger2040w")]
-        {
-            battery = Battery::sample(p.ADC.reborrow(), vsys_pin.reborrow(), vsys_gate.reborrow());
-        }
+        let mut battery = Battery::sample(p.ADC.reborrow(), vsys_pin.reborrow(), vsys_gate.reborrow());
         let Some(now) = rtc.read_datetime() else {
             Timer::after(Duration::from_secs(1)).await;
             continue;
@@ -268,46 +305,70 @@ async fn main(spawner: Spawner) {
         let unix = now.unix();
         let code = totp(&key[..key_len], unix);
         let remaining = 30 - (unix % 30) as u32;
+        let fresh = remaining > 25; // first tick of a new window: new digits
+        let full = force_clean || (fresh && (unix / 30).is_multiple_of(u64::from(FULL_EVERY)));
+        force_clean = false;
 
         draw_code(&mut canvas, levels, code, &now, remaining, (battery.percent(), battery.on_usb()));
-        let full = windows.is_multiple_of(FULL_EVERY);
-        epd.set_speed(if full { SPEED_CLEAN } else { SPEED_CODE });
+        epd.set_speed(if full {
+            SPEED_CLEAN
+        } else if fresh {
+            SPEED_CODE
+        } else {
+            Speed::Turbo
+        });
         epd.present_levels(levels).await;
-        windows += 1;
 
-        // Tick the countdown bar until the window rolls over, watching
-        // buttons throughout. Full TURBO refreshes rather than partials: a
-        // partial only re-scans the bar's columns (see `Epd::present_partial`)
-        // but every update still wiggles the whole panel's source lines, so
-        // undriven pixels fade a little per pass — the full refresh restores
-        // the digits each tick instead.
-        let window_id = unix / 30;
-        epd.set_speed(Speed::Turbo);
-        loop {
-            let sleep = Timer::after(Duration::from_secs(5));
-            match embassy_futures::select::select(sleep, EVENTS.receive()).await {
-                embassy_futures::select::Either::First(()) => {
-                    let Some(t) = rtc.read_datetime() else { break };
-                    let u = t.unix();
-                    if u / 30 != window_id {
-                        break; // next code
-                    }
-                    draw_code(&mut canvas, levels, code, &t, 30 - (u % 30) as u32, (battery.percent(), battery.on_usb()));
-                    epd.present_levels(levels).await;
-                }
-                embassy_futures::select::Either::Second(ButtonEvent::Pressed(Button::A)) => {
-                    windows = 0; // force a clean SLOW refresh now
-                    break;
-                }
-                embassy_futures::select::Either::Second(ButtonEvent::Pressed(Button::B)) => {
-                    // Deliberate re-provision: require a fresh secret.
-                    key_len = setup(&mut epd, &mut canvas, levels, &mut rtc, &mut settings, &mut key, 0).await;
-                    windows = 0;
-                    break;
-                }
-                _ => {}
-            }
+        // Hybrid duty cycle: on battery this powers off and never returns —
+        // the RTC alarm cold-boots the next tick. Falls through on USB.
+        #[cfg(feature = "badger2040w")]
+        if !battery.on_usb() {
+            sleep_until_tick(&mut rtc, &mut power_latch).await;
         }
+
+        // Resident tick: wait out the next 5 s boundary, watching buttons.
+        let wait = rtc.read_datetime().map_or(5, |t| {
+            let gap = 5 - t.unix() % 5;
+            if gap == 0 { 5 } else { gap }
+        });
+        match embassy_futures::select::select(Timer::after(Duration::from_secs(wait)), EVENTS.receive()).await {
+            embassy_futures::select::Either::Second(ButtonEvent::Pressed(Button::A)) => {
+                force_clean = true; // clean SLOW refresh next pass
+            }
+            embassy_futures::select::Either::Second(ButtonEvent::Pressed(Button::B)) => {
+                // Deliberate re-provision: require a fresh secret.
+                key_len = setup(&mut epd, &mut canvas, levels, &mut rtc, &mut settings, &mut key, 0).await;
+                force_clean = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The 2040 W hybrid duty cycle: arm the RTC alarm for the next 5 s bar
+/// tick and drop the EN_3V3 latch. On battery the board powers off right
+/// here and the alarm (or any front button) cold-boots it — one tick's
+/// work per 5 s window instead of an always-on CPU. On USB the rail stays
+/// up regardless, so execution falls through: re-latch, disarm, and let
+/// the resident loop tick instead.
+#[cfg(feature = "badger2040w")]
+async fn sleep_until_tick(rtc: &mut RtcRam, latch: &mut Output<'static>) {
+    let Some(now) = rtc.read_datetime() else { return };
+    // Land on the next multiple of 5 s, but give the latch drop at least
+    // 2 s of margin — a near-boundary tick slips one window rather than
+    // arming an alarm for a second that may already be passing.
+    let gap = 5 - (now.unix() % 5) as u32;
+    let gap = if gap < 2 { gap + 5 } else { gap };
+    if rtc.set_alarm_in(gap) {
+        Timer::after(Duration::from_millis(50)).await;
+        latch.set_low();
+        Timer::after(Duration::from_millis(500)).await;
+        // Still running: USB is holding the rail up.
+        latch.set_high();
+        rtc.clear_alarm();
+        log::info!("on USB; ticking live");
+    } else {
+        log::warn!("could not arm RTC alarm; ticking live");
     }
 }
 

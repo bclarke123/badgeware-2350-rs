@@ -13,7 +13,9 @@
 //! Uses the blocking ADC (a battery sample is 20 conversions, microseconds).
 
 #[cfg(not(feature = "tufty"))]
-use embassy_rp::adc::{Adc, Blocking, Channel, Config};
+use embassy_rp::adc::{Adc, Channel, Config};
+#[cfg(feature = "badger")]
+use embassy_rp::adc::Blocking;
 #[cfg(any(feature = "badger", feature = "tufty"))]
 use embassy_rp::gpio::Input;
 #[cfg(not(feature = "tufty"))]
